@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 source "$(dirname "$0")/../common.sh"
+
+# Start QEMU and return immediately after the daemon is running.
+# RDP readiness is checked separately by the workflow so a broken RDP service
+# never prevents emergency access through the QEMU VNC console.
 python3 "$ROOT_DIR/scripts/libvm.py" boot
-python3 "$ROOT_DIR/scripts/libvm.py" wait-rdp --timeout "${RDP_TIMEOUT_SECONDS:-900}"
