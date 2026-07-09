@@ -46,6 +46,29 @@ jobs:
         run: scripts/bootstrap/install.sh
       - name: Authenticate Backblaze
         run: scripts/backblaze/login
+      - name: Enable KVM access
+        run: |
+          set -Eeuo pipefail
+
+          if [[ ! -e /dev/kvm ]]; then
+            echo "::error::/dev/kvm is not available on this runner"
+            exit 1
+          fi
+
+          echo "Before:"
+          ls -l /dev/kvm
+
+          sudo chmod 666 /dev/kvm
+
+          echo "After:"
+          ls -l /dev/kvm
+
+          if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+            echo "::error::Current runner user cannot access /dev/kvm"
+            exit 1
+          fi
+
+          echo "KVM access enabled successfully"
       - name: Build minimal Windows base image
         run: |
           scripts/qemu/build-base \
