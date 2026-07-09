@@ -1,52 +1,80 @@
-name: build-base-image
+name: build-base-image-vnc
+
 on:
   workflow_dispatch:
     inputs:
       windows_iso_url:
         description: Direct HTTPS URL to Windows ISO
         required: true
+        type: string
+
       virtio_iso_url:
         description: Direct HTTPS URL to virtio-win ISO
         required: true
         default: https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso
+        type: string
+
       disk_size:
+        description: Virtual disk size
         required: false
         default: 80G
+        type: string
+
       memory_mb:
+        description: VM memory in MB
         required: false
         default: "8192"
+        type: string
+
       cpu_cores:
+        description: Number of virtual CPU cores
         required: false
         default: "4"
+        type: string
+
       install_timeout_minutes:
+        description: Maximum time to wait for Windows to shut down
         required: false
         default: "180"
+        type: string
+
       windows_iso_sha256:
+        description: Optional SHA256 of the Windows ISO
         required: false
         default: ""
+        type: string
+
       virtio_iso_sha256:
+        description: Optional SHA256 of the VirtIO ISO
         required: false
         default: ""
+        type: string
+
 concurrency:
   group: windows-vm-base-image
   cancel-in-progress: false
+
 jobs:
   base:
     runs-on: ubuntu-latest
     timeout-minutes: 240
+
     env:
       B2_BUCKET: ${{ secrets.B2_BUCKET }}
       B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
       B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
       B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
       WINDOWS_ADMIN_PASSWORD: ${{ secrets.WINDOWS_ADMIN_PASSWORD }}
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Install dependencies
         run: scripts/bootstrap/install.sh
-      - name: Authenticate Backblaze
-        run: scripts/backblaze/login
+
       - name: Enable KVM access
+        shell: bash
         run: |
           set -Eeuo pipefail
 
@@ -55,22 +83,95 @@ jobs:
             exit 1
           fi
 
-          echo "Before:"
-          ls -l /dev/kvm
-
           sudo chmod 666 /dev/kvm
-
-          echo "After:"
-          ls -l /dev/kvm
 
           if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
             echo "::error::Current runner user cannot access /dev/kvm"
             exit 1
           fi
 
+          ls -l /dev/kvm
           echo "KVM access enabled successfully"
-      - name: Build minimal Windows base image
+
+      - name: Authenticate Backblaze B2
+        run: scripts/backblaze/login
+
+      - name: Connect runner to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Configure secure VNC access over Tailscale
+        id: vnc
+        shell: bash
         run: |
+          set -Eeuo pipefail
+
+          TS_IP="$(tailscale ip -4 | head -n 1)"
+
+          if [[ -z "$TS_IP" ]]; then
+            echo "::error::Could not determine the Tailscale IPv4 address"
+            exit 1
+          fi
+
+          echo "tailscale_ip=$TS_IP" >> "$GITHUB_OUTPUT"
+
+          # Allow VNC only through the Tailscale network interface.
+          sudo iptables -I INPUT 1 -i tailscale0 -p tcp --dport 5900 -j ACCEPT
+          sudo iptables -I INPUT 2 -p tcp --dport 5900 -j DROP
+
+          echo "============================================================"
+          echo "Windows installer VNC console"
+          echo "Connect your VNC client to:"
+          echo
+          echo "    ${TS_IP}:5900"
+          echo
+          echo "The VNC port is restricted to the tailscale0 interface."
+          echo "Shut down Windows normally when installation is complete."
+          echo "The workflow will then compact and upload base.qcow2 to B2."
+          echo "============================================================"
+
+      - name: Enable QEMU VNC display
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("scripts/libbase.py")
+          text = path.read_text(encoding="utf-8")
+
+          old = "'-daemonize','-display','none','-serial'"
+          new = "'-daemonize','-vnc','0.0.0.0:0','-serial'"
+
+          if old not in text:
+              raise SystemExit(
+                  "Could not find the expected QEMU '-display none' arguments "
+                  "in scripts/libbase.py"
+              )
+
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          print("QEMU display changed from headless mode to VNC on TCP port 5900")
+          PY
+
+      - name: Show VNC connection details
+        shell: bash
+        run: |
+          echo "VNC address: ${{ steps.vnc.outputs.tailscale_ip }}:5900"
+          echo "Keep this workflow running while you install Windows."
+          echo "When installation is complete, shut down Windows normally."
+
+      - name: Build Windows base image with interactive VNC console
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "Starting QEMU."
+          echo "VNC address: ${{ steps.vnc.outputs.tailscale_ip }}:5900"
+
           scripts/qemu/build-base \
             --windows-iso-url "${{ inputs.windows_iso_url }}" \
             --virtio-iso-url "${{ inputs.virtio_iso_url }}" \
@@ -81,13 +182,16 @@ jobs:
             --memory-mb "${{ inputs.memory_mb }}" \
             --cpu-cores "${{ inputs.cpu_cores }}" \
             --install-timeout-minutes "${{ inputs.install_timeout_minutes }}"
+
       - name: Upload base image to Backblaze B2
         run: scripts/backblaze/upload-base
+
       - name: Upload build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: base-image-logs
+          if-no-files-found: ignore
           path: |
             logs/*.log
             work/base.sha256
