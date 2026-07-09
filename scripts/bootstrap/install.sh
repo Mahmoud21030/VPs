@@ -21,7 +21,8 @@ sudo apt-get install -y \
     qemu-utils \
     ovmf \
     socat \
-    netcat-openbsd
+    netcat-openbsd \
+    genisoimage
 
 if ! command -v aws >/dev/null 2>&1; then
     log "installing AWS CLI v2"
@@ -66,6 +67,7 @@ log "verifying dependencies"
 required_commands=(
     aws
     curl
+    genisoimage
     jq
     qemu-img
     qemu-system-x86_64
@@ -84,4 +86,3 @@ done
 log "AWS CLI version: $(aws --version 2>&1)"
 log "QEMU version: $(qemu-system-x86_64 --version | head -n 1)"
 log "host dependencies installed successfully"
-
