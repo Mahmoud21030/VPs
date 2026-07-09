@@ -7,7 +7,7 @@ for p in (WORK, LOGS): p.mkdir(parents=True, exist_ok=True)
 def cfg(name):
     with open(ROOT/'config'/name, 'r', encoding='utf-8') as f: return json.load(f)
 def log(msg):
-    s=f"[{datetime.datetime.utcnow().replace(microsecond=0).isoformat()}Z] {msg}"
+    s=f"[{datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace('+00:00','Z').removesuffix('Z')}Z] {msg}"
     print(s, flush=True)
     with open(LOGS/'runtime.log','a',encoding='utf-8') as f: f.write(s+'\n')
 def run(cmd, check=True, **kw):
@@ -94,7 +94,7 @@ def boot():
     if not vars_path.exists(): shutil.copyfile(v['uefi_vars_template'], vars_path)
     sock=ROOT/v['qmp_socket']; sock.unlink(missing_ok=True)
     pid=ROOT/v['pid_file']; pid.unlink(missing_ok=True)
-    cmd=['qemu-system-x86_64','-enable-kvm','-machine','q35,accel=kvm','-m',str(v['memory_mb']),'-smp',str(v['cpu_cores']),'-cpu','host','-drive',f"if=pflash,format=raw,readonly=on,file={v['uefi_code']}",'-drive',f"if=pflash,format=raw,file={vars_path}",'-drive',f"file={overlay},if=virtio,format=qcow2,cache=writeback,discard=unmap,id={v['disk_id']}",'-netdev',f"user,id={v['network_user_id']},hostfwd=tcp::%s-:%s"%(v['rdp_host_port'],v['rdp_guest_port']),'-device',f"virtio-net-pci,netdev={v['network_user_id']}",'-qmp',f"unix:{sock},server=on,wait=off",'-pidfile',str(pid),'-daemonize','-display','none','-serial','file:'+str(ROOT/v['monitor_log'])]
+    cmd=['qemu-system-x86_64','-enable-kvm','-machine','q35,accel=kvm','-m',str(v['memory_mb']),'-smp',str(v['cpu_cores']),'-cpu','host','-drive',f"if=pflash,format=raw,readonly=on,file={v['uefi_code']}",'-drive',f"if=pflash,format=raw,file={vars_path}",'-drive',f"file={overlay},if=virtio,format=qcow2,cache=writeback,discard=unmap,id={v['disk_id']}",'-netdev',f"user,id={v['network_user_id']},hostfwd=tcp::%s-:%s"%(v['rdp_host_port'],v['rdp_guest_port']),'-device',f"virtio-net-pci,netdev={v['network_user_id']}",'-qmp',f"unix:{sock},server=on,wait=off",'-pidfile',str(pid),'-daemonize','-vnc',f"{v.get('vnc_listen','0.0.0.0')}:{v.get('vnc_display',0)}",'-serial','file:'+str(ROOT/v['monitor_log'])]
     run(cmd); log('qemu started')
 def wait_rdp(timeout=900):
     port=cfg('vm.json')['rdp_host_port']; end=time.time()+timeout
@@ -124,7 +124,7 @@ def checkpoint(name='latest'):
         run(['qemu-img','convert','-O','qcow2','-c',overlay,str(overlay)+'.compact'])
         Path(str(overlay)+'.compact').replace(overlay); log('overlay compacted')
         compress(overlay, comp); digest=write_sha(comp, sha)
-        manifest={'version':1,'created_utc':datetime.datetime.utcnow().replace(microsecond=0).isoformat()+'Z','name':name,'sha256':digest,'compressed':'overlay.qcow2.zst','base_object':s['base_object']}
+        manifest={'version':1,'created_utc':datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace('+00:00','Z'),'name':name,'sha256':digest,'compressed':'overlay.qcow2.zst','base_object':s['base_object']}
         (WORK/'manifest.json').write_text(json.dumps(manifest,indent=2), encoding='utf-8')
         if name=='latest':
             targets=[(s['latest_object'],comp),(s['latest_sha256_object'],sha),(s['manifest_object'],WORK/'manifest.json')]
