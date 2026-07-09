@@ -33,19 +33,19 @@ on:
         type: string
 
       install_timeout_minutes:
-        description: Maximum time to wait for Windows to shut down
+        description: Maximum time to wait for manual Windows installation and shutdown
         required: false
         default: "180"
         type: string
 
       windows_iso_sha256:
-        description: Optional SHA256 of the Windows ISO
+        description: Optional SHA256 of Windows ISO
         required: false
         default: ""
         type: string
 
       virtio_iso_sha256:
-        description: Optional SHA256 of the VirtIO ISO
+        description: Optional SHA256 of VirtIO ISO
         required: false
         default: ""
         type: string
@@ -64,7 +64,6 @@ jobs:
       B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
       B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
       B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
-      WINDOWS_ADMIN_PASSWORD: ${{ secrets.WINDOWS_ADMIN_PASSWORD }}
 
     steps:
       - name: Checkout repository
@@ -84,14 +83,12 @@ jobs:
           fi
 
           sudo chmod 666 /dev/kvm
+          ls -l /dev/kvm
 
           if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
             echo "::error::Current runner user cannot access /dev/kvm"
             exit 1
           fi
-
-          ls -l /dev/kvm
-          echo "KVM access enabled successfully"
 
       - name: Authenticate Backblaze B2
         run: scripts/backblaze/login
@@ -103,85 +100,70 @@ jobs:
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
 
-      - name: Configure secure VNC access over Tailscale
+      - name: Get Tailscale VNC address
         id: vnc
         shell: bash
         run: |
           set -Eeuo pipefail
 
           TS_IP="$(tailscale ip -4 | head -n 1)"
-
           if [[ -z "$TS_IP" ]]; then
-            echo "::error::Could not determine the Tailscale IPv4 address"
+            echo "::error::Could not determine Tailscale IPv4 address"
             exit 1
           fi
 
           echo "tailscale_ip=$TS_IP" >> "$GITHUB_OUTPUT"
-
-          # Allow VNC only through the Tailscale network interface.
-          sudo iptables -I INPUT 1 -i tailscale0 -p tcp --dport 5900 -j ACCEPT
-          sudo iptables -I INPUT 2 -p tcp --dport 5900 -j DROP
-
-          echo "============================================================"
-          echo "Windows installer VNC console"
-          echo "Connect your VNC client to:"
-          echo
-          echo "    ${TS_IP}:5900"
-          echo
-          echo "The VNC port is restricted to the tailscale0 interface."
-          echo "Shut down Windows normally when installation is complete."
-          echo "The workflow will then compact and upload base.qcow2 to B2."
-          echo "============================================================"
-
-      - name: Enable QEMU VNC display
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("scripts/libbase.py")
-          text = path.read_text(encoding="utf-8")
-
-          old = "'-daemonize','-display','none','-serial'"
-          new = "'-daemonize','-vnc','0.0.0.0:0','-serial'"
-
-          if old not in text:
-              raise SystemExit(
-                  "Could not find the expected QEMU '-display none' arguments "
-                  "in scripts/libbase.py"
-              )
-
-          path.write_text(text.replace(old, new, 1), encoding="utf-8")
-          print("QEMU display changed from headless mode to VNC on TCP port 5900")
-          PY
-
-      - name: Show VNC connection details
-        shell: bash
-        run: |
-          echo "VNC address: ${{ steps.vnc.outputs.tailscale_ip }}:5900"
-          echo "Keep this workflow running while you install Windows."
-          echo "When installation is complete, shut down Windows normally."
+          echo "VNC address will be: ${TS_IP}:5900"
+          tailscale status
 
       - name: Build Windows base image with interactive VNC console
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          echo "Starting QEMU."
+          echo "Starting QEMU base-image builder"
           echo "VNC address: ${{ steps.vnc.outputs.tailscale_ip }}:5900"
+          echo "Install Windows manually, then shut Windows down normally."
 
           scripts/qemu/build-base \
             --windows-iso-url "${{ inputs.windows_iso_url }}" \
             --virtio-iso-url "${{ inputs.virtio_iso_url }}" \
             --windows-iso-sha256 "${{ inputs.windows_iso_sha256 }}" \
             --virtio-iso-sha256 "${{ inputs.virtio_iso_sha256 }}" \
-            --admin-password "$WINDOWS_ADMIN_PASSWORD" \
             --disk-size "${{ inputs.disk_size }}" \
             --memory-mb "${{ inputs.memory_mb }}" \
             --cpu-cores "${{ inputs.cpu_cores }}" \
-            --install-timeout-minutes "${{ inputs.install_timeout_minutes }}"
+            --install-timeout-minutes "${{ inputs.install_timeout_minutes }}" &
+
+          BUILD_PID=$!
+
+          echo "Waiting for VNC server on TCP 5900..."
+          for _ in $(seq 1 180); do
+            if ss -ltn | grep -q ':5900 '; then
+              echo "============================================================"
+              echo "VNC SERVER READY"
+              echo "Address: ${{ steps.vnc.outputs.tailscale_ip }}:5900"
+              echo "============================================================"
+              ss -ltnp | grep ':5900' || true
+              break
+            fi
+
+            if ! kill -0 "$BUILD_PID" 2>/dev/null; then
+              echo "::error::Base-image builder exited before VNC became ready"
+              wait "$BUILD_PID"
+              exit $?
+            fi
+
+            sleep 2
+          done
+
+          if ! ss -ltn | grep -q ':5900 '; then
+            echo "::error::VNC server did not become ready"
+            wait "$BUILD_PID" || true
+            exit 1
+          fi
+
+          wait "$BUILD_PID"
 
       - name: Upload base image to Backblaze B2
         run: scripts/backblaze/upload-base
