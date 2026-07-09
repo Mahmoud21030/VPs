@@ -1,54 +1,241 @@
 name: runtime
+
 on:
   workflow_dispatch:
     inputs:
       memory_mb:
+        description: VM memory in MB
         required: false
         default: "8192"
+        type: string
       cpu_cores:
+        description: Number of virtual CPU cores
         required: false
         default: "4"
+        type: string
+
 concurrency:
   group: windows-vm-runtime
   cancel-in-progress: false
+
 jobs:
   vm:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+
     env:
       B2_BUCKET: ${{ secrets.B2_BUCKET }}
       B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
       B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
       B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+
     steps:
-      - uses: actions/checkout@v4
-      - name: Configure runtime
-        run: |
-          jq '.memory_mb=($ENV.MEMORY_MB|tonumber) | .cpu_cores=($ENV.CPU_CORES|tonumber)' config/vm.json > config/vm.json.tmp
-          mv config/vm.json.tmp config/vm.json
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure runtime resources
+        shell: bash
         env:
           MEMORY_MB: ${{ inputs.memory_mb }}
           CPU_CORES: ${{ inputs.cpu_cores }}
+        run: |
+          set -Eeuo pipefail
+
+          jq \
+            '.memory_mb=($ENV.MEMORY_MB|tonumber)
+             | .cpu_cores=($ENV.CPU_CORES|tonumber)' \
+            config/vm.json > config/vm.json.tmp
+
+          mv config/vm.json.tmp config/vm.json
+
       - name: Install dependencies
         run: scripts/bootstrap/install.sh
-      - name: Authenticate Backblaze
+
+      - name: Enable KVM access
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          if [[ ! -e /dev/kvm ]]; then
+            echo "::error::/dev/kvm is not available on this runner"
+            exit 1
+          fi
+
+          sudo chmod 666 /dev/kvm
+
+          if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+            echo "::error::Current runner user cannot access /dev/kvm"
+            exit 1
+          fi
+
+          ls -l /dev/kvm
+          echo "KVM access enabled successfully"
+
+      - name: Authenticate Backblaze B2
         run: scripts/backblaze/login
-      - name: Restore persistent overlay
+
+      - name: Connect runner to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Get Tailscale connection information
+        id: tailscale
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          TS_IP="$(tailscale ip -4 | head -n 1)"
+
+          if [[ -z "$TS_IP" ]]; then
+            echo "::error::Could not determine the Tailscale IPv4 address"
+            exit 1
+          fi
+
+          echo "ip=$TS_IP" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Windows VM connection"
+            echo
+            echo "- **RDP:** \`${TS_IP}:3389\`"
+            echo "- **Emergency VNC console:** \`${TS_IP}:5900\`"
+            echo "- VNC authentication: none"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "============================================================"
+          echo "WINDOWS VM CONNECTION INFORMATION"
+          echo
+          echo "RDP: ${TS_IP}:3389"
+          echo "VNC: ${TS_IP}:5900"
+          echo
+          echo "Use RDP for normal work."
+          echo "Use VNC for boot, recovery, driver, or RDP problems."
+          echo "============================================================"
+
+          tailscale status
+
+      - name: Restore persistent VM
         run: scripts/restore/restore
-      - name: Boot VM
+
+      - name: Boot Windows VM
         run: scripts/qemu/boot
+
+      - name: Wait for VNC console
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "Waiting for QEMU VNC console on local port 5900..."
+
+          for attempt in $(seq 1 90); do
+            if nc -z 127.0.0.1 5900 2>/dev/null; then
+              echo "============================================================"
+              echo "VNC CONSOLE READY"
+              echo "Connect to: ${{ steps.tailscale.outputs.ip }}:5900"
+              echo "============================================================"
+              ss -ltnp | grep ':5900' || true
+              exit 0
+            fi
+
+            if [[ -f work/qemu.pid ]]; then
+              QEMU_PID="$(cat work/qemu.pid)"
+              if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+                echo "::error::QEMU exited before the VNC console became ready"
+                tail -n 200 work/qemu.log 2>/dev/null || true
+                exit 1
+              fi
+            fi
+
+            sleep 2
+          done
+
+          echo "::error::VNC console did not become ready within 180 seconds"
+          tail -n 200 work/qemu.log 2>/dev/null || true
+          exit 1
+
+      - name: Wait for Windows RDP
+        id: rdp
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "Waiting up to 15 minutes for Windows RDP..."
+          python3 scripts/libvm.py wait-rdp --timeout 900
+
+      - name: Show connection status
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "============================================================"
+          echo "WINDOWS VM CONNECTION STATUS"
+          echo
+          echo "VNC: ${{ steps.tailscale.outputs.ip }}:5900"
+          echo "RDP: ${{ steps.tailscale.outputs.ip }}:3389"
+          echo
+
+          if [[ "${{ steps.rdp.outcome }}" == "success" ]]; then
+            echo "RDP is ready."
+          else
+            echo "WARNING: RDP is not ready."
+            echo "The workflow will remain running."
+            echo "Use VNC to inspect or repair Windows."
+          fi
+
+          echo "============================================================"
+
       - name: Start checkpoint loop
+        shell: bash
         run: |
-          nohup scripts/checkpoint/loop > logs/checkpoint-loop.log 2>&1 &
+          set -Eeuo pipefail
+
+          nohup scripts/checkpoint/loop \
+            > logs/checkpoint-loop.log 2>&1 &
+
           echo $! > work/checkpoint-loop.pid
+          echo "Checkpoint loop started with PID $(cat work/checkpoint-loop.pid)"
+
       - name: Keep runtime alive
+        shell: bash
         run: |
+          set -Eeuo pipefail
+
+          echo "============================================================"
+          echo "VM IS RUNNING"
+          echo
+          echo "RDP: ${{ steps.tailscale.outputs.ip }}:3389"
+          echo "VNC: ${{ steps.tailscale.outputs.ip }}:5900"
+          echo "============================================================"
+
+          if [[ ! -f work/qemu.pid ]]; then
+            echo "::error::QEMU PID file is missing"
+            exit 1
+          fi
+
           while true; do
             sleep 60
-            if [ -f work/qemu.pid ] && ! kill -0 "$(cat work/qemu.pid)" 2>/dev/null; then
+
+            QEMU_PID="$(cat work/qemu.pid)"
+            if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+              echo "QEMU has exited. Runtime step is ending."
               exit 0
             fi
           done
+
       - name: Cleanup checkpoint
         if: always()
         run: scripts/cleanup/cleanup
+
+      - name: Upload runtime logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-logs
+          if-no-files-found: ignore
+          path: |
+            logs/*.log
+            work/qemu.log
