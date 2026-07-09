@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+source "$(dirname "$0")/../common.sh"
+python3 "$ROOT_DIR/scripts/libvm.py" create-overlay "${1:-$ROOT_DIR/work/base.qcow2}" "${2:-$ROOT_DIR/work/overlay.qcow2}"

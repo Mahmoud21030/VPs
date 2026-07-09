@@ -1,0 +1,54 @@
+name: runtime
+on:
+  workflow_dispatch:
+    inputs:
+      memory_mb:
+        required: false
+        default: "8192"
+      cpu_cores:
+        required: false
+        default: "4"
+concurrency:
+  group: windows-vm-runtime
+  cancel-in-progress: false
+jobs:
+  vm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      B2_BUCKET: ${{ secrets.B2_BUCKET }}
+      B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
+      B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+      B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure runtime
+        run: |
+          jq '.memory_mb=($ENV.MEMORY_MB|tonumber) | .cpu_cores=($ENV.CPU_CORES|tonumber)' config/vm.json > config/vm.json.tmp
+          mv config/vm.json.tmp config/vm.json
+        env:
+          MEMORY_MB: ${{ inputs.memory_mb }}
+          CPU_CORES: ${{ inputs.cpu_cores }}
+      - name: Install dependencies
+        run: scripts/bootstrap/install.sh
+      - name: Authenticate Backblaze
+        run: scripts/backblaze/login
+      - name: Restore persistent overlay
+        run: scripts/restore/restore
+      - name: Boot VM
+        run: scripts/qemu/boot
+      - name: Start checkpoint loop
+        run: |
+          nohup scripts/checkpoint/loop > logs/checkpoint-loop.log 2>&1 &
+          echo $! > work/checkpoint-loop.pid
+      - name: Keep runtime alive
+        run: |
+          while true; do
+            sleep 60
+            if [ -f work/qemu.pid ] && ! kill -0 "$(cat work/qemu.pid)" 2>/dev/null; then
+              exit 0
+            fi
+          done
+      - name: Cleanup checkpoint
+        if: always()
+        run: scripts/cleanup/cleanup

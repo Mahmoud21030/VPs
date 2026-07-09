@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+source "$(dirname "$0")/../common.sh"
+python3 "$ROOT_DIR/scripts/libvm.py" boot
+python3 "$ROOT_DIR/scripts/libvm.py" wait-rdp --timeout "${RDP_TIMEOUT_SECONDS:-900}"

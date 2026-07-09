@@ -1,0 +1,13 @@
+{
+  "bucket_env": "B2_BUCKET",
+  "endpoint_env": "B2_ENDPOINT",
+  "access_key_env": "B2_KEY_ID",
+  "secret_key_env": "B2_APPLICATION_KEY",
+  "remote_prefix": "windows-vm",
+  "base_object": "base.qcow2",
+  "latest_object": "latest/overlay.qcow2.zst",
+  "latest_sha256_object": "latest/overlay.sha256",
+  "manifest_object": "latest/manifest.json",
+  "checkpoint_prefix": "checkpoints",
+  "rotation_count": 3
+}

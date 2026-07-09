@@ -1,0 +1,71 @@
+name: build-base-image
+on:
+  workflow_dispatch:
+    inputs:
+      windows_iso_url:
+        description: Direct HTTPS URL to Windows ISO
+        required: true
+      virtio_iso_url:
+        description: Direct HTTPS URL to virtio-win ISO
+        required: true
+        default: https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso
+      disk_size:
+        required: false
+        default: 80G
+      memory_mb:
+        required: false
+        default: "8192"
+      cpu_cores:
+        required: false
+        default: "4"
+      install_timeout_minutes:
+        required: false
+        default: "180"
+      windows_iso_sha256:
+        required: false
+        default: ""
+      virtio_iso_sha256:
+        required: false
+        default: ""
+concurrency:
+  group: windows-vm-base-image
+  cancel-in-progress: false
+jobs:
+  base:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      B2_BUCKET: ${{ secrets.B2_BUCKET }}
+      B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
+      B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+      B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+      WINDOWS_ADMIN_PASSWORD: ${{ secrets.WINDOWS_ADMIN_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: scripts/bootstrap/install.sh
+      - name: Authenticate Backblaze
+        run: scripts/backblaze/login
+      - name: Build minimal Windows base image
+        run: |
+          scripts/qemu/build-base \
+            --windows-iso-url "${{ inputs.windows_iso_url }}" \
+            --virtio-iso-url "${{ inputs.virtio_iso_url }}" \
+            --windows-iso-sha256 "${{ inputs.windows_iso_sha256 }}" \
+            --virtio-iso-sha256 "${{ inputs.virtio_iso_sha256 }}" \
+            --admin-password "$WINDOWS_ADMIN_PASSWORD" \
+            --disk-size "${{ inputs.disk_size }}" \
+            --memory-mb "${{ inputs.memory_mb }}" \
+            --cpu-cores "${{ inputs.cpu_cores }}" \
+            --install-timeout-minutes "${{ inputs.install_timeout_minutes }}"
+      - name: Upload base image to Backblaze B2
+        run: scripts/backblaze/upload-base
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: base-image-logs
+          path: |
+            logs/*.log
+            work/base.sha256
+            work/base-manifest.json

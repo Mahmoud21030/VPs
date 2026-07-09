@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+source "$(dirname "$0")/../common.sh"
+python3 - "$@" <<'PY'
+import json, sys
+from scripts.libvm import qmp_cmd
+args=json.loads(sys.argv[2]) if len(sys.argv)>2 else None
+print(json.dumps(qmp_cmd(sys.argv[1], args), indent=2))
+PY

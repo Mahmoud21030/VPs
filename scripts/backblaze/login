@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+source "$(dirname "$0")/../common.sh"
+: "${B2_BUCKET:?}" "${B2_ENDPOINT:?}" "${B2_KEY_ID:?}" "${B2_APPLICATION_KEY:?}"
+export AWS_ACCESS_KEY_ID="$B2_KEY_ID" AWS_SECRET_ACCESS_KEY="$B2_APPLICATION_KEY" AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-005}"
+aws --endpoint-url "$B2_ENDPOINT" s3 ls "s3://$B2_BUCKET" >/dev/null
+log "backblaze authentication verified"

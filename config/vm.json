@@ -1,0 +1,18 @@
+{
+  "name": "persistent-windows-qemu",
+  "memory_mb": 8192,
+  "cpu_cores": 4,
+  "base_image": "work/base.qcow2",
+  "overlay_image": "work/overlay.qcow2",
+  "overlay_compressed": "work/overlay.qcow2.zst",
+  "uefi_code": "/usr/share/OVMF/OVMF_CODE.fd",
+  "uefi_vars_template": "/usr/share/OVMF/OVMF_VARS.fd",
+  "uefi_vars": "work/OVMF_VARS.fd",
+  "rdp_host_port": 3389,
+  "rdp_guest_port": 3389,
+  "qmp_socket": "work/qmp.sock",
+  "pid_file": "work/qemu.pid",
+  "monitor_log": "work/qemu.log",
+  "network_user_id": "net0",
+  "disk_id": "osdisk0"
+}

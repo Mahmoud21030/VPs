@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+source "$(dirname "$0")/../common.sh"
+interval="$(jq -r '.interval_minutes' "$ROOT_DIR/config/checkpoint.json")"
+while true; do
+  sleep "$((interval*60))"
+  "$ROOT_DIR/scripts/checkpoint/checkpoint" latest || log "checkpoint failed"
+done

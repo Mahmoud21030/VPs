@@ -1,0 +1,12 @@
+{
+  "interval_minutes": 120,
+  "guest_flush_timeout_seconds": 30,
+  "pause_timeout_seconds": 30,
+  "qmp_timeout_seconds": 20,
+  "compression_level": 10,
+  "zstd_threads": 0,
+  "upload_retries": 5,
+  "download_retries": 5,
+  "retry_initial_seconds": 2,
+  "retry_max_seconds": 60
+}
