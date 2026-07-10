@@ -1,8 +1,26 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 source "$(dirname "$0")/../common.sh"
-interval="$(jq -r '.interval_minutes' "$ROOT_DIR/config/checkpoint.json")"
+
+interval="$(jq -r '.interval_minutes // 15' "$ROOT_DIR/config/checkpoint.json")"
+
+if [[ ! "$interval" =~ ^[0-9]+$ ]] || (( interval < 1 )); then
+  log "invalid checkpoint interval: $interval"
+  exit 1
+fi
+
+log "automatic checkpoint loop started: every ${interval} minute(s)"
+
 while true; do
-  sleep "$((interval*60))"
-  "$ROOT_DIR/scripts/checkpoint/checkpoint" latest || log "checkpoint failed"
+  log "next automatic checkpoint in ${interval} minute(s)"
+  sleep "$((interval * 60))"
+
+  log "automatic checkpoint starting"
+
+  if "$ROOT_DIR/scripts/checkpoint/checkpoint" latest; then
+    log "automatic checkpoint completed successfully"
+  else
+    status=$?
+    log "automatic checkpoint failed with exit code $status; loop will continue"
+  fi
 done

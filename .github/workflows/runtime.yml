@@ -28,6 +28,12 @@ on:
         default: 220G
         type: string
 
+      checkpoint_interval_minutes:
+        description: Automatic checkpoint interval in minutes
+        required: false
+        default: "15"
+        type: string
+
       virtio_iso_url:
         description: Direct HTTPS URL to the VirtIO Windows driver ISO
         required: false
@@ -357,6 +363,33 @@ jobs:
           fi
 
           echo "============================================================"
+
+      - name: Configure automatic checkpoint interval
+        shell: bash
+        env:
+          CHECKPOINT_INTERVAL_MINUTES: ${{ inputs.checkpoint_interval_minutes }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ ! "$CHECKPOINT_INTERVAL_MINUTES" =~ ^[0-9]+$ ]]; then
+            echo "::error::checkpoint_interval_minutes must be a positive integer"
+            exit 1
+          fi
+
+          if (( CHECKPOINT_INTERVAL_MINUTES < 1 )); then
+            echo "::error::checkpoint_interval_minutes must be at least 1"
+            exit 1
+          fi
+
+          jq \
+            --argjson interval "$CHECKPOINT_INTERVAL_MINUTES" \
+            '.interval_minutes=$interval' \
+            config/checkpoint.json > config/checkpoint.json.tmp
+
+          mv config/checkpoint.json.tmp config/checkpoint.json
+
+          echo "Automatic checkpoint interval: ${CHECKPOINT_INTERVAL_MINUTES} minute(s)"
+          cat config/checkpoint.json
 
       - name: Start checkpoint loop
         shell: bash

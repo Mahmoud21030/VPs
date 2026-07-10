@@ -332,6 +332,174 @@ def shutdown():
             if subprocess.run(['kill','-0',str(p)], stderr=subprocess.DEVNULL).returncode!=0: return
             time.sleep(5)
         raise SystemExit('qemu did not exit after ACPI shutdown')
+def wait_for_qmp_backup_job(job_id, timeout_seconds):
+    deadline = time.time() + timeout_seconds
+    last_progress_log = 0.0
+
+    while time.time() < deadline:
+        if not qemu_is_running():
+            raise RuntimeError(
+                f'QEMU exited while live backup job {job_id!r} was running'
+            )
+
+        jobs = qmp_cmd('query-jobs')
+        job = next((item for item in jobs if item.get('id') == job_id), None)
+
+        if job is None:
+            raise RuntimeError(
+                f'live backup job {job_id!r} disappeared before completion'
+            )
+
+        status = job.get('status', 'unknown')
+
+        now = time.time()
+        if now - last_progress_log >= 15:
+            progress_text = ''
+
+            try:
+                block_jobs = qmp_cmd('query-block-jobs')
+                block_job = next(
+                    (
+                        item
+                        for item in block_jobs
+                        if item.get('device') == job_id
+                    ),
+                    None,
+                )
+
+                if block_job:
+                    total = int(block_job.get('len') or 0)
+                    offset = int(block_job.get('offset') or 0)
+
+                    if total > 0:
+                        percent = (offset * 100.0) / total
+                        progress_text = (
+                            f' progress={percent:.1f}% '
+                            f'({offset}/{total} bytes)'
+                        )
+            except Exception as e:
+                progress_text = f' progress unavailable: {e}'
+
+            log(
+                f'live backup job {job_id}: '
+                f'status={status}{progress_text}'
+            )
+            last_progress_log = now
+
+        if status == 'concluded':
+            error = job.get('error')
+
+            try:
+                qmp_cmd('job-dismiss', {'id': job_id})
+            except Exception as dismiss_error:
+                log(
+                    f'live backup job dismiss warning for {job_id}: '
+                    f'{dismiss_error}'
+                )
+
+            if error:
+                raise RuntimeError(
+                    f'live backup job {job_id!r} failed: {error}'
+                )
+
+            log(f'live backup job completed successfully: {job_id}')
+            return
+
+        time.sleep(2)
+
+    raise TimeoutError(
+        f'live backup job {job_id!r} exceeded '
+        f'{timeout_seconds} seconds'
+    )
+
+
+def create_live_point_in_time_backup(v, target):
+    target = Path(target)
+    target.unlink(missing_ok=True)
+
+    job_id = 'persistent-checkpoint-backup'
+    timeout_seconds = int(
+        cfg('checkpoint.json').get(
+            'online_backup_timeout_seconds',
+            3600,
+        )
+    )
+
+    # Clean up a stale concluded job if one somehow remains.
+    try:
+        jobs = qmp_cmd('query-jobs')
+        stale = next(
+            (item for item in jobs if item.get('id') == job_id),
+            None,
+        )
+
+        if stale:
+            status = stale.get('status')
+
+            if status == 'concluded':
+                qmp_cmd('job-dismiss', {'id': job_id})
+            else:
+                raise RuntimeError(
+                    f'cannot start checkpoint because QMP job '
+                    f'{job_id!r} already exists with status={status!r}'
+                )
+    except RuntimeError:
+        raise
+    except Exception as e:
+        log(f'stale QMP job check warning: {e}')
+
+    log(
+        'starting QEMU point-in-time live backup '
+        f'device={v["disk_id"]} target={target}'
+    )
+
+    try:
+        qmp_cmd(
+            'drive-backup',
+            {
+                'job-id': job_id,
+                'device': v['disk_id'],
+                'sync': 'full',
+                'target': str(target),
+                'format': 'qcow2',
+                'compress': False,
+                'auto-finalize': True,
+                'auto-dismiss': False,
+            },
+        )
+
+        wait_for_qmp_backup_job(job_id, timeout_seconds)
+
+    except Exception:
+        if qemu_is_running():
+            try:
+                qmp_cmd('job-cancel', {'id': job_id, 'force': True})
+            except Exception:
+                pass
+
+            try:
+                jobs = qmp_cmd('query-jobs')
+                stale = next(
+                    (item for item in jobs if item.get('id') == job_id),
+                    None,
+                )
+
+                if stale and stale.get('status') == 'concluded':
+                    qmp_cmd('job-dismiss', {'id': job_id})
+            except Exception:
+                pass
+
+        raise
+
+    if not target.exists():
+        raise RuntimeError(
+            f'QEMU reported successful live backup but target is missing: '
+            f'{target}'
+        )
+
+    log(f'QEMU live backup target ready: {target}')
+
+
 def checkpoint(name='latest'):
     v = cfg('vm.json')
     s = cfg('storage.json')
@@ -342,6 +510,7 @@ def checkpoint(name='latest'):
     sha = WORK / 'overlay.sha256'
     qmp_socket = ROOT / v['qmp_socket']
     lock_path = WORK / 'checkpoint.lock'
+    live_backup = WORK / 'online-checkpoint-source.qcow2'
 
     if not overlay.exists():
         raise SystemExit('overlay missing')
@@ -353,71 +522,71 @@ def checkpoint(name='latest'):
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         log('checkpoint lock acquired')
 
-        frozen = False
-        paused = False
-        online_checkpoint = qemu_is_running(v) and qmp_socket.exists()
-
-        if online_checkpoint:
-            log('QEMU is running; creating online checkpoint')
-
-            try:
-                qmp_cmd('guest-fsfreeze-freeze')
-                frozen = True
-                log('guest fs frozen')
-            except Exception as e:
-                log(f'guest fs freeze unavailable: {e}')
-
-            try:
-                qmp_cmd('stop')
-                paused = True
-                log('vm paused')
-            except Exception as e:
-                # A shutdown may finish between the running check and QMP stop.
-                if wait_for_qemu_exit(v, timeout=10):
-                    online_checkpoint = False
-                    paused = False
-                    frozen = False
-                    log(
-                        'QEMU exited while checkpoint was starting; '
-                        'continuing with safe offline checkpoint'
-                    )
-                else:
-                    raise RuntimeError(
-                        f'could not pause running VM for checkpoint: {e}'
-                    ) from e
-        else:
-            log(
-                'QEMU is not running or QMP socket is absent; '
-                'creating offline checkpoint from the stopped VM overlay'
-            )
+        checkpoint_mode = None
+        checkpoint_source = None
 
         try:
-            # Never copy/compact an actively running, unpaused overlay.
-            if qemu_is_running(v) and not paused:
-                raise RuntimeError(
-                    'refusing to checkpoint because QEMU is still running '
-                    'but the VM could not be paused'
+            running = qemu_is_running(v)
+            qmp_available = qmp_socket.exists()
+
+            if running and qmp_available:
+                # Do not run qemu-img directly against a disk that the live
+                # QEMU process owns. QEMU keeps the image lock even while the
+                # VM is paused. Instead, ask QEMU itself to create a
+                # point-in-time full backup target.
+                log(
+                    'QEMU is running; creating point-in-time live backup '
+                    'without opening the active disk with qemu-img'
                 )
 
-            run(['qemu-img', 'check', '-r', 'leaks', overlay], check=False)
+                create_live_point_in_time_backup(v, live_backup)
 
-            compact = Path(str(overlay) + '.compact')
-            compact.unlink(missing_ok=True)
+                # The backup job is finished and QEMU has released the target.
+                run(
+                    ['qemu-img', 'check', '-r', 'leaks', live_backup],
+                    check=False,
+                )
 
-            run([
-                'qemu-img',
-                'convert',
-                '-p',
-                '-O', 'qcow2',
-                '-c',
-                overlay,
-                compact,
-            ])
+                checkpoint_source = live_backup
+                checkpoint_mode = 'online-live-backup'
 
-            compact.replace(overlay)
-            log('overlay compacted')
+            elif running:
+                raise RuntimeError(
+                    'QEMU is running but the QMP socket is unavailable; '
+                    'refusing an unsafe direct copy of the active disk'
+                )
 
-            compress(overlay, comp)
+            else:
+                log(
+                    'QEMU is stopped; creating offline checkpoint from '
+                    'the inactive VM overlay'
+                )
+
+                run(
+                    ['qemu-img', 'check', '-r', 'leaks', overlay],
+                    check=False,
+                )
+
+                compact = Path(str(overlay) + '.compact')
+                compact.unlink(missing_ok=True)
+
+                run([
+                    'qemu-img',
+                    'convert',
+                    '-p',
+                    '-O', 'qcow2',
+                    '-c',
+                    overlay,
+                    compact,
+                ])
+
+                compact.replace(overlay)
+                log('offline overlay compacted')
+
+                checkpoint_source = overlay
+                checkpoint_mode = 'offline-stopped'
+
+            compress(checkpoint_source, comp)
             digest = write_sha(comp, sha)
 
             manifest = {
@@ -431,8 +600,10 @@ def checkpoint(name='latest'):
                 'sha256': digest,
                 'compressed': 'overlay.qcow2.zst',
                 'base_object': s['base_object'],
-                'checkpoint_mode': (
-                    'online-paused' if paused else 'offline-stopped'
+                'checkpoint_mode': checkpoint_mode,
+                'checkpoint_interval_minutes': c.get(
+                    'interval_minutes',
+                    15,
                 ),
             }
 
@@ -482,24 +653,11 @@ def checkpoint(name='latest'):
 
             log(
                 f'checkpoint uploaded and verified: {name} '
-                f'({"online-paused" if paused else "offline-stopped"})'
+                f'({checkpoint_mode})'
             )
+
         finally:
-            # Only resume/thaw when QEMU still exists and was actually paused.
-            if paused and qemu_is_running(v) and qmp_socket.exists():
-                if frozen:
-                    try:
-                        qmp_cmd('guest-fsfreeze-thaw')
-                        log('guest fs thawed')
-                    except Exception as e:
-                        log(f'guest fs thaw failed: {e}')
-
-                try:
-                    qmp_cmd('cont')
-                    log('vm resumed')
-                except Exception as e:
-                    log(f'vm resume unavailable because QEMU is exiting: {e}')
-
+            live_backup.unlink(missing_ok=True)
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
             log('checkpoint lock released')
 
