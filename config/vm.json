@@ -1,6 +1,6 @@
 {
   "name": "persistent-windows-qemu",
-  "memory_mb": 8192,
+  "memory_mb": 15360,
   "cpu_cores": 4,
   "base_image": "work/base.qcow2",
   "overlay_image": "work/overlay.qcow2",
