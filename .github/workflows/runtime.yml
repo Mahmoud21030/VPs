@@ -22,6 +22,12 @@ on:
         default: "4"
         type: string
 
+      disk_size:
+        description: Virtual Windows disk size, must be above 80G (example 220G)
+        required: false
+        default: 220G
+        type: string
+
       virtio_iso_url:
         description: Direct HTTPS URL to the VirtIO Windows driver ISO
         required: false
@@ -58,23 +64,102 @@ jobs:
       ORACLE_SECRET_ACCESS_KEY: ${{ secrets.ORACLE_SECRET_ACCESS_KEY }}
 
     steps:
+      - name: Show runner CPU RAM and disk specifications
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "============================================================"
+          echo "RUNNER SPECIFICATIONS"
+          echo "============================================================"
+
+          echo
+          echo "=== OPERATING SYSTEM ==="
+          uname -a
+          cat /etc/os-release || true
+
+          echo
+          echo "=== CPU ==="
+          echo "Logical CPUs: $(nproc)"
+          lscpu
+
+          echo
+          echo "=== RAM ==="
+          free -h
+          grep -E 'MemTotal|MemAvailable|SwapTotal|SwapFree' /proc/meminfo || true
+
+          echo
+          echo "=== BLOCK DEVICES ==="
+          lsblk -o NAME,TYPE,SIZE,FSTYPE,FSAVAIL,MOUNTPOINTS || true
+
+          echo
+          echo "=== FILESYSTEM SPACE ==="
+          df -hT
+
+          echo
+          echo "=== RAW FILESYSTEM SPACE IN BYTES ==="
+          df -B1 -P
+
+          {
+            echo "### Runner specifications"
+            echo
+            echo "- Logical CPUs: \`$(nproc)\`"
+            echo "- RAM: \`$(free -h | awk '/^Mem:/ {print $2}')\`"
+            echo
+            echo '```text'
+            df -hT
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Configure runtime resources
+      - name: Use largest writable filesystem for VM files
+        shell: bash
+        run: scripts/bootstrap/prepare-work-drive.sh
+
+      - name: Configure runtime resources and virtual disk size
         shell: bash
         env:
           MEMORY_MB: ${{ inputs.memory_mb }}
           CPU_CORES: ${{ inputs.cpu_cores }}
+          DISK_SIZE: ${{ inputs.disk_size }}
         run: |
           set -Eeuo pipefail
 
+          if [[ ! "$MEMORY_MB" =~ ^[0-9]+$ ]] || (( MEMORY_MB < 1024 )); then
+            echo "::error::memory_mb must be an integer of at least 1024"
+            exit 1
+          fi
+
+          if [[ ! "$CPU_CORES" =~ ^[0-9]+$ ]] || (( CPU_CORES < 1 )); then
+            echo "::error::cpu_cores must be a positive integer"
+            exit 1
+          fi
+
+          if [[ ! "$DISK_SIZE" =~ ^[0-9]+G$ ]]; then
+            echo "::error::disk_size must use whole GiB syntax such as 220G"
+            exit 1
+          fi
+
+          disk_gib="${DISK_SIZE%G}"
+
+          if (( disk_gib <= 80 )); then
+            echo "::error::disk_size must be above 80G"
+            exit 1
+          fi
+
           jq \
+            --arg disk_size "$DISK_SIZE" \
             '.memory_mb=($ENV.MEMORY_MB|tonumber)
-             | .cpu_cores=($ENV.CPU_CORES|tonumber)' \
+             | .cpu_cores=($ENV.CPU_CORES|tonumber)
+             | .disk_size=$disk_size' \
             config/vm.json > config/vm.json.tmp
 
           mv config/vm.json.tmp config/vm.json
+
+          echo "Configured VM:"
+          jq '{memory_mb, cpu_cores, disk_size}' config/vm.json
 
       - name: Install dependencies
         run: scripts/bootstrap/install.sh
@@ -129,7 +214,6 @@ jobs:
             echo
             echo "- **RDP:** \`${TS_IP}:3389\`"
             echo "- **Emergency VNC console:** \`${TS_IP}:5900\`"
-            echo "- **VirtIO driver CD:** mounted automatically inside Windows"
             echo "- VNC authentication: none"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -165,7 +249,16 @@ jobs:
           rm -f "$temp_path"
 
           echo "Downloading VirtIO Windows driver ISO..."
-          curl             --fail             --location             --retry 5             --retry-delay 3             --retry-all-errors             --progress-bar             "$VIRTIO_ISO_URL"             --output "$temp_path"
+
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-delay 3 \
+            --retry-all-errors \
+            --progress-bar \
+            "$VIRTIO_ISO_URL" \
+            --output "$temp_path"
 
           if [[ -n "${VIRTIO_ISO_SHA256:-}" ]]; then
             expected="$(printf '%s' "$VIRTIO_ISO_SHA256" | tr '[:upper:]' '[:lower:]')"

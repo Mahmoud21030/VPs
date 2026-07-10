@@ -23,7 +23,7 @@ on:
         type: string
 
       disk_size:
-        description: Virtual Windows disk size (sparse QCOW2)
+        description: Virtual Windows disk size, must be above 80G (example 220G)
         required: false
         default: 220G
         type: string
@@ -82,8 +82,80 @@ jobs:
       ORACLE_SECRET_ACCESS_KEY: ${{ secrets.ORACLE_SECRET_ACCESS_KEY }}
 
     steps:
+      - name: Show runner CPU RAM and disk specifications
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "============================================================"
+          echo "RUNNER SPECIFICATIONS"
+          echo "============================================================"
+
+          echo
+          echo "=== OPERATING SYSTEM ==="
+          uname -a
+          cat /etc/os-release || true
+
+          echo
+          echo "=== CPU ==="
+          echo "Logical CPUs: $(nproc)"
+          lscpu
+
+          echo
+          echo "=== RAM ==="
+          free -h
+          grep -E 'MemTotal|MemAvailable|SwapTotal|SwapFree' /proc/meminfo || true
+
+          echo
+          echo "=== BLOCK DEVICES ==="
+          lsblk -o NAME,TYPE,SIZE,FSTYPE,FSAVAIL,MOUNTPOINTS || true
+
+          echo
+          echo "=== FILESYSTEM SPACE ==="
+          df -hT
+
+          echo
+          echo "=== RAW FILESYSTEM SPACE IN BYTES ==="
+          df -B1 -P
+
+          {
+            echo "### Runner specifications"
+            echo
+            echo "- Logical CPUs: \`$(nproc)\`"
+            echo "- RAM: \`$(free -h | awk '/^Mem:/ {print $2}')\`"
+            echo
+            echo '```text'
+            df -hT
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Use largest writable filesystem for VM files
+        shell: bash
+        run: scripts/bootstrap/prepare-work-drive.sh
+
+      - name: Validate requested virtual disk size
+        shell: bash
+        env:
+          DISK_SIZE: ${{ inputs.disk_size }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ ! "$DISK_SIZE" =~ ^[0-9]+G$ ]]; then
+            echo "::error::disk_size must use whole GiB syntax such as 220G"
+            exit 1
+          fi
+
+          disk_gib="${DISK_SIZE%G}"
+
+          if (( disk_gib <= 80 )); then
+            echo "::error::disk_size must be above 80G"
+            exit 1
+          fi
+
+          echo "Requested Windows virtual disk size: $DISK_SIZE"
 
       - name: Install dependencies
         run: scripts/bootstrap/install.sh

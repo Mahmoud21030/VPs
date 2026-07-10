@@ -16,5 +16,6 @@
   "network_user_id": "net0",
   "disk_id": "osdisk0",
   "vnc_listen": "0.0.0.0",
-  "vnc_display": 0
+  "vnc_display": 0,
+  "disk_size": "220G"
 }

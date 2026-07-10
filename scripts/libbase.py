@@ -7,6 +7,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -42,6 +43,18 @@ def run(command: list[str | Path], *, check: bool = True, **kwargs: object) -> s
 
 def cfg(name: str) -> dict:
     return json.loads((ROOT / "config" / name).read_text(encoding="utf-8"))
+
+
+def parse_qemu_size(value: str) -> int:
+    text = str(value).strip().upper()
+    match = re.fullmatch(r"([1-9][0-9]*)([KMGTPE]?)B?", text)
+    if not match:
+        raise ValueError(f"invalid QEMU disk size: {value!r}; use values such as 220G")
+
+    number = int(match.group(1))
+    unit = match.group(2)
+    power = {"": 0, "K": 1, "M": 2, "G": 3, "T": 4, "P": 5, "E": 6}[unit]
+    return number * (1024 ** power)
 
 
 
@@ -206,6 +219,14 @@ def wait_for_poweroff(pidfile: str | Path, timeout_seconds: int) -> None:
 def build(args: argparse.Namespace) -> None:
     vm = cfg("vm.json")
     checkpoint = cfg("checkpoint.json")
+
+    requested_disk_bytes = parse_qemu_size(args.disk_size)
+    if requested_disk_bytes < 81 * (1024 ** 3):
+        raise SystemExit(
+            f"disk size must be above 80G; received {args.disk_size}"
+        )
+
+    log(f"requested Windows virtual disk size: {args.disk_size}")
 
     windows_iso = WORK / "windows.iso"
     virtio_iso = WORK / "virtio-win.iso"

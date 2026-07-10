@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, datetime, hashlib, json, os, shutil, socket, subprocess, sys, time
+import argparse, datetime, hashlib, json, os, re, shutil, socket, subprocess, sys, time
 from pathlib import Path
 ROOT=Path(os.environ.get('ROOT_DIR', Path(__file__).resolve().parents[1]))
 WORK=ROOT/'work'; LOGS=ROOT/'logs'
@@ -105,6 +105,63 @@ def decompress(src,dst):
     tmp=str(dst)+'.tmp'; Path(tmp).unlink(missing_ok=True)
     run(['zstd','-d','--force','--rm','-o',tmp,src])
     Path(tmp).replace(dst); log(f"decompressed {src} -> {dst}")
+def parse_qemu_size(value):
+    text=str(value).strip().upper()
+    match=re.fullmatch(r'([1-9][0-9]*)([KMGTPE]?)B?', text)
+    if not match:
+        raise ValueError(f"invalid QEMU disk size: {value!r}; use values such as 220G")
+    number=int(match.group(1))
+    unit=match.group(2)
+    power={'':0,'K':1,'M':2,'G':3,'T':4,'P':5,'E':6}[unit]
+    return number*(1024**power)
+
+def qemu_virtual_size(path):
+    result=run(
+        ['qemu-img','info','--output=json',path],
+        stdout=subprocess.PIPE,
+    )
+    info=json.loads(result.stdout)
+    return int(info['virtual-size'])
+
+def ensure_virtual_disk_size(path, requested_size):
+    target_bytes=parse_qemu_size(requested_size)
+    minimum_bytes=81*(1024**3)
+
+    if target_bytes < minimum_bytes:
+        raise SystemExit(
+            f"requested virtual disk size must be above 80G; got {requested_size}"
+        )
+
+    current_bytes=qemu_virtual_size(path)
+    current_gib=current_bytes/(1024**3)
+    target_gib=target_bytes/(1024**3)
+
+    log(
+        f"virtual disk size check: current={current_gib:.2f}GiB "
+        f"requested={target_gib:.2f}GiB path={path}"
+    )
+
+    if target_bytes < current_bytes:
+        raise SystemExit(
+            f"refusing to shrink virtual disk from {current_gib:.2f}GiB "
+            f"to {target_gib:.2f}GiB"
+        )
+
+    if target_bytes == current_bytes:
+        log("virtual disk already has requested size")
+        return
+
+    run(['qemu-img','resize','-f','qcow2',path,requested_size])
+
+    resized_bytes=qemu_virtual_size(path)
+    if resized_bytes != target_bytes:
+        raise SystemExit(
+            f"virtual disk resize verification failed: expected={target_bytes} "
+            f"actual={resized_bytes}"
+        )
+
+    log(f"virtual disk expanded successfully to {requested_size}")
+
 def create_overlay(base, overlay):
     Path(overlay).parent.mkdir(parents=True, exist_ok=True)
     if Path(overlay).exists(): return
@@ -146,17 +203,57 @@ def qmp_cmd(cmd,args=None):
     v=cfg('vm.json'); c=cfg('checkpoint.json')
     with QMP(ROOT/v['qmp_socket'], c.get('qmp_timeout_seconds',20)) as q: return q.cmd(cmd,args)
 def boot():
-    v=cfg('vm.json'); base=ROOT/v['base_image']; overlay=ROOT/v['overlay_image']
+    v=cfg('vm.json')
+    base=ROOT/v['base_image']
+    overlay=ROOT/v['overlay_image']
     virtio_iso=WORK/'virtio-win.iso'
-    if not base.exists(): raise SystemExit(f"missing base image: {base}")
-    if not virtio_iso.exists(): raise SystemExit(f"missing VirtIO driver ISO: {virtio_iso}")
+    requested_disk_size=v.get('disk_size','220G')
+
+    if not base.exists():
+        raise SystemExit(f"missing base image: {base}")
+
+    if not virtio_iso.exists():
+        raise SystemExit(f"missing VirtIO driver ISO: {virtio_iso}")
+
     create_overlay(base, overlay)
+    ensure_virtual_disk_size(overlay, requested_disk_size)
+
     vars_path=ROOT/v['uefi_vars']
-    if not vars_path.exists(): shutil.copyfile(v['uefi_vars_template'], vars_path)
-    sock=ROOT/v['qmp_socket']; sock.unlink(missing_ok=True)
-    pid=ROOT/v['pid_file']; pid.unlink(missing_ok=True)
-    cmd=['qemu-system-x86_64','-enable-kvm','-machine','q35,accel=kvm','-m',str(v['memory_mb']),'-smp',str(v['cpu_cores']),'-cpu','host','-drive',f"if=pflash,format=raw,readonly=on,file={v['uefi_code']}",'-drive',f"if=pflash,format=raw,file={vars_path}",'-drive',f"file={overlay},if=virtio,format=qcow2,cache=writeback,discard=unmap,id={v['disk_id']}",'-drive',f"if=none,id=virtiocd,file={virtio_iso},format=raw,media=cdrom,readonly=on",'-device','ide-cd,drive=virtiocd','-netdev',f"user,id={v['network_user_id']},hostfwd=tcp::%s-:%s"%(v['rdp_host_port'],v['rdp_guest_port']),'-device',f"virtio-net-pci,netdev={v['network_user_id']}",'-qmp',f"unix:{sock},server=on,wait=off",'-pidfile',str(pid),'-daemonize','-vnc',f"{v.get('vnc_listen','0.0.0.0')}:{v.get('vnc_display',0)}",'-serial','file:'+str(ROOT/v['monitor_log'])]
-    run(cmd); log('qemu started')
+    if not vars_path.exists():
+        shutil.copyfile(v['uefi_vars_template'], vars_path)
+
+    sock=ROOT/v['qmp_socket']
+    sock.unlink(missing_ok=True)
+
+    pid=ROOT/v['pid_file']
+    pid.unlink(missing_ok=True)
+
+    cmd=[
+        'qemu-system-x86_64',
+        '-enable-kvm',
+        '-machine','q35,accel=kvm',
+        '-m',str(v['memory_mb']),
+        '-smp',str(v['cpu_cores']),
+        '-cpu','host',
+        '-drive',f"if=pflash,format=raw,readonly=on,file={v['uefi_code']}",
+        '-drive',f"if=pflash,format=raw,file={vars_path}",
+        '-drive',f"file={overlay},if=virtio,format=qcow2,cache=writeback,discard=unmap,id={v['disk_id']}",
+        '-drive',f"if=none,id=virtiocd,file={virtio_iso},format=raw,media=cdrom,readonly=on",
+        '-device','ide-cd,drive=virtiocd',
+        '-netdev',f"user,id={v['network_user_id']},hostfwd=tcp::{v['rdp_host_port']}-:{v['rdp_guest_port']}",
+        '-device',f"virtio-net-pci,netdev={v['network_user_id']}",
+        '-qmp',f"unix:{sock},server=on,wait=off",
+        '-pidfile',str(pid),
+        '-daemonize',
+        '-vnc',f"{v.get('vnc_listen','0.0.0.0')}:{v.get('vnc_display',0)}",
+        '-serial','file:'+str(ROOT/v['monitor_log']),
+    ]
+
+    run(cmd)
+    log(
+        f"qemu started with virtual disk size {requested_disk_size}; "
+        f"VirtIO driver ISO mounted as CD-ROM"
+    )
 def wait_rdp(timeout=900):
     port=cfg('vm.json')['rdp_host_port']; end=time.time()+timeout
     while time.time()<end:
