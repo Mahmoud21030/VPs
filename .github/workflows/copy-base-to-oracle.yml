@@ -120,15 +120,21 @@ jobs:
           set -Eeuo pipefail
 
           mkdir -p "$RUNNER_TEMP/aws"
+
           cat > "$RUNNER_TEMP/aws/config" <<'EOF'
           [default]
           region = us-east-1
+          request_checksum_calculation = when_required
+          response_checksum_validation = when_required
           s3 =
             addressing_style = path
+            signature_version = s3v4
           EOF
 
           echo "AWS_CONFIG_FILE=$RUNNER_TEMP/aws/config" >> "$GITHUB_ENV"
           echo "AWS_EC2_METADATA_DISABLED=true" >> "$GITHUB_ENV"
+          echo "AWS_REQUEST_CHECKSUM_CALCULATION=when_required" >> "$GITHUB_ENV"
+          echo "AWS_RESPONSE_CHECKSUM_VALIDATION=when_required" >> "$GITHUB_ENV"
 
       - name: Download base image from Backblaze
         shell: bash
@@ -259,6 +265,9 @@ jobs:
               AWS_ACCESS_KEY_ID="$ORACLE_ACCESS_KEY_ID" \
               AWS_SECRET_ACCESS_KEY="$ORACLE_SECRET_ACCESS_KEY" \
               AWS_DEFAULT_REGION="$ORACLE_REGION" \
+              AWS_REQUEST_CHECKSUM_CALCULATION="when_required" \
+              AWS_RESPONSE_CHECKSUM_VALIDATION="when_required" \
+              AWS_EC2_METADATA_DISABLED="true" \
               aws \
                 --endpoint-url "$ORACLE_ENDPOINT" \
                 "$@"
@@ -296,6 +305,9 @@ jobs:
               AWS_ACCESS_KEY_ID="$ORACLE_ACCESS_KEY_ID" \
               AWS_SECRET_ACCESS_KEY="$ORACLE_SECRET_ACCESS_KEY" \
               AWS_DEFAULT_REGION="$ORACLE_REGION" \
+              AWS_REQUEST_CHECKSUM_CALCULATION="when_required" \
+              AWS_RESPONSE_CHECKSUM_VALIDATION="when_required" \
+              AWS_EC2_METADATA_DISABLED="true" \
               aws \
                 --endpoint-url "$ORACLE_ENDPOINT" \
                 "$@"
