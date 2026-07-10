@@ -108,7 +108,6 @@ def aws_cp(src, dst):
         '--endpoint-url', endpoint(),
         's3', 'cp',
         src, dst,
-        '--only-show-errors',
     ]
 
     # AWS CLI v2 tries to preserve tags and metadata during S3-to-S3
@@ -132,7 +131,6 @@ def aws_rm_recursive(uri):
             's3', 'rm',
             uri,
             '--recursive',
-            '--only-show-errors',
         ],
         env=aws_env(),
     )
