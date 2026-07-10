@@ -51,9 +51,29 @@ export AWS_SECRET_ACCESS_KEY="$secret_key"
 export AWS_DEFAULT_REGION="$region"
 export AWS_EC2_METADATA_DISABLED=true
 
+# AWS CLI v2 may use optional request checksums with aws-chunked transfer
+# encoding. OCI's S3 compatibility API rejects that encoding for multipart
+# UploadPart requests, so only calculate/validate checksums when required.
+export AWS_REQUEST_CHECKSUM_CALCULATION=when_required
+export AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
+
+# Also write the equivalent AWS CLI config as a fallback for every aws
+# process started later in the workflow.
+mkdir -p "$HOME/.aws"
+cat > "$HOME/.aws/config" <<EOF
+[default]
+region = $region
+request_checksum_calculation = when_required
+response_checksum_validation = when_required
+s3 =
+  addressing_style = path
+  signature_version = s3v4
+EOF
+
 if [[ "$provider" == "backblaze" ]]; then
   aws --endpoint-url "$endpoint" s3 ls "s3://$bucket" >/dev/null
 else
   aws --endpoint-url "$endpoint" s3api head-bucket --bucket "$bucket" >/dev/null
 fi
 log "storage authentication verified: provider=$provider bucket=$bucket endpoint=$endpoint region=$region"
+log "AWS CLI checksum compatibility: request=when_required response=when_required addressing_style=path"

@@ -81,6 +81,11 @@ jobs:
       ORACLE_ACCESS_KEY_ID: ${{ secrets.ORACLE_ACCESS_KEY_ID }}
       ORACLE_SECRET_ACCESS_KEY: ${{ secrets.ORACLE_SECRET_ACCESS_KEY }}
 
+      # AWS CLI v2 compatibility for OCI/S3-compatible multipart uploads.
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      AWS_EC2_METADATA_DISABLED: "true"
+
     steps:
       - name: Show runner CPU RAM and disk specifications
         shell: bash

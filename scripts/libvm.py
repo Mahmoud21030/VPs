@@ -84,6 +84,14 @@ def aws_env():
     env['AWS_SECRET_ACCESS_KEY'] = context['secret_key']
     env['AWS_DEFAULT_REGION'] = context['region']
     env['AWS_EC2_METADATA_DISABLED'] = 'true'
+
+    # AWS CLI v2 can add request checksums using aws-chunked encoding.
+    # OCI Object Storage's S3 compatibility API does not accept that
+    # encoding for these multipart UploadPart requests. Restrict checksum
+    # calculation/validation to API operations where it is required.
+    env['AWS_REQUEST_CHECKSUM_CALCULATION'] = 'when_required'
+    env['AWS_RESPONSE_CHECKSUM_VALIDATION'] = 'when_required'
+
     return env
 
 def s3_uri(obj):

@@ -145,6 +145,12 @@ def aws_env() -> dict[str, str]:
     environment["AWS_SECRET_ACCESS_KEY"] = context["secret_key"]
     environment["AWS_DEFAULT_REGION"] = context["region"]
     environment["AWS_EC2_METADATA_DISABLED"] = "true"
+
+    # Prevent AWS CLI v2 from using optional request-checksum aws-chunked
+    # encoding against S3-compatible providers such as OCI Object Storage.
+    environment["AWS_REQUEST_CHECKSUM_CALCULATION"] = "when_required"
+    environment["AWS_RESPONSE_CHECKSUM_VALIDATION"] = "when_required"
+
     return environment
 
 
