@@ -123,6 +123,19 @@ def aws_cp(src, dst):
     return run(cmd, env=aws_env())
 def aws_ls(uri): return subprocess.run(['aws','--endpoint-url',endpoint(),'s3','ls',uri], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=aws_env()).returncode==0
 def aws_rm(uri): return run(['aws','--endpoint-url',endpoint(),'s3','rm',uri,'--only-show-errors'], env=aws_env(), check=False)
+
+def aws_rm_recursive(uri):
+    return run(
+        [
+            'aws',
+            '--endpoint-url', endpoint(),
+            's3', 'rm',
+            uri,
+            '--recursive',
+            '--only-show-errors',
+        ],
+        env=aws_env(),
+    )
 def compress(src,dst):
     c=cfg('checkpoint.json'); threads=str(c.get('zstd_threads',0)); level='-'+str(c.get('compression_level',10))
     tmp=str(dst)+'.tmp'; Path(tmp).unlink(missing_ok=True)
@@ -662,14 +675,69 @@ def checkpoint(name='latest'):
             log('checkpoint lock released')
 
 def rotate():
-    s=cfg('storage.json');
-    for i in range(s.get('rotation_count',3),0,-1):
-        src='latest' if i==1 else f"{s['checkpoint_prefix'].strip('/')}/checkpoint{i-1}"
-        dst=f"{s['checkpoint_prefix'].strip('/')}/checkpoint{i}"
-        for f in ['overlay.qcow2.zst','overlay.sha256','manifest.json']:
-            srcobj=(s['latest_object'] if src=='latest' and f=='overlay.qcow2.zst' else s['latest_sha256_object'] if src=='latest' and f=='overlay.sha256' else s['manifest_object'] if src=='latest' else f'{src}/{f}')
-            srcuri=s3_uri(srcobj)
-            if aws_ls(srcuri): aws_cp(srcuri, s3_uri(f'{dst}/{f}'))
+    s = cfg('storage.json')
+    rotation_count = int(s.get('rotation_count', 0))
+
+    if rotation_count <= 0:
+        log(
+            'checkpoint rotation disabled; keeping only one latest overlay '
+            'plus the immutable base image'
+        )
+        return
+
+    for i in range(rotation_count, 0, -1):
+        src = (
+            'latest'
+            if i == 1
+            else f"{s['checkpoint_prefix'].strip('/')}/checkpoint{i-1}"
+        )
+        dst = f"{s['checkpoint_prefix'].strip('/')}/checkpoint{i}"
+
+        for filename in [
+            'overlay.qcow2.zst',
+            'overlay.sha256',
+            'manifest.json',
+        ]:
+            srcobj = (
+                s['latest_object']
+                if src == 'latest' and filename == 'overlay.qcow2.zst'
+                else s['latest_sha256_object']
+                if src == 'latest' and filename == 'overlay.sha256'
+                else s['manifest_object']
+                if src == 'latest'
+                else f'{src}/{filename}'
+            )
+
+            srcuri = s3_uri(srcobj)
+
+            if aws_ls(srcuri):
+                aws_cp(srcuri, s3_uri(f'{dst}/{filename}'))
+
+
+def prune_old_checkpoints():
+    s = cfg('storage.json')
+    checkpoint_prefix = s.get('checkpoint_prefix', 'checkpoints').strip('/')
+
+    if not checkpoint_prefix:
+        raise RuntimeError(
+            'refusing to prune because checkpoint_prefix is empty'
+        )
+
+    uri = s3_uri(checkpoint_prefix + '/')
+
+    log(f'deleting old rotated checkpoints only: {uri}')
+    log(
+        'base image and latest overlay are intentionally untouched'
+    )
+
+    aws_rm_recursive(uri)
+
+    log(
+        'old rotated checkpoints removed successfully; '
+        'only base + latest overlay policy remains'
+    )
+
+
 def restore():
     v=cfg('vm.json'); s=cfg('storage.json'); c=cfg('checkpoint.json')
     base=ROOT/v['base_image']; comp=ROOT/v['overlay_compressed']; overlay=ROOT/v['overlay_image']; sha=WORK/'overlay.sha256'
@@ -693,7 +761,7 @@ def retry(maxn,delay,cap,func,*args):
             time.sleep(delay); n+=1; delay=min(delay*2,cap)
 def main():
     p=argparse.ArgumentParser(); sub=p.add_subparsers(dest='cmd', required=True)
-    for x in ['boot','restore','shutdown','rotate']: sub.add_parser(x)
+    for x in ['boot','restore','shutdown','rotate','prune-old-checkpoints']: sub.add_parser(x)
     a=sub.add_parser('wait-rdp'); a.add_argument('--timeout',type=int,default=900)
     a=sub.add_parser('checkpoint'); a.add_argument('--name',default='latest')
     a=sub.add_parser('sha256'); a.add_argument('path'); a.add_argument('out')
@@ -702,7 +770,19 @@ def main():
     a=sub.add_parser('compress'); a.add_argument('src'); a.add_argument('dst')
     a=sub.add_parser('decompress'); a.add_argument('src'); a.add_argument('dst')
     ns=p.parse_args();
-    {'boot':boot,'restore':restore,'shutdown':shutdown,'rotate':rotate}.get(ns.cmd,lambda:None)() if ns.cmd in ['boot','restore','shutdown','rotate'] else None
+    {
+        'boot': boot,
+        'restore': restore,
+        'shutdown': shutdown,
+        'rotate': rotate,
+        'prune-old-checkpoints': prune_old_checkpoints,
+    }.get(ns.cmd, lambda: None)() if ns.cmd in [
+        'boot',
+        'restore',
+        'shutdown',
+        'rotate',
+        'prune-old-checkpoints',
+    ] else None
     if ns.cmd=='wait-rdp': wait_rdp(ns.timeout)
     elif ns.cmd=='checkpoint': rotate(); checkpoint(ns.name)
     elif ns.cmd=='sha256': write_sha(ns.path, ns.out)

@@ -198,6 +198,12 @@ jobs:
       - name: Authenticate selected object storage
         run: scripts/storage/login
 
+      - name: Remove old rotated checkpoints and reclaim storage
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/libvm.py prune-old-checkpoints
+
       - name: Connect runner to Tailscale
         uses: tailscale/github-action@v4
         with:
