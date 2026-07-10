@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-export STORAGE_PROVIDER=backblaze
+export STORAGE_PROVIDER=oracle
 exec "$(dirname "$0")/../storage/upload-base" "$@"

@@ -14,5 +14,7 @@
   "pid_file": "work/qemu.pid",
   "monitor_log": "work/qemu.log",
   "network_user_id": "net0",
-  "disk_id": "osdisk0"
+  "disk_id": "osdisk0",
+  "vnc_listen": "0.0.0.0",
+  "vnc_display": 0
 }

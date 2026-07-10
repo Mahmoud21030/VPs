@@ -44,6 +44,58 @@ def cfg(name: str) -> dict:
     return json.loads((ROOT / "config" / name).read_text(encoding="utf-8"))
 
 
+
+def storage_provider() -> str:
+    storage = cfg("storage.json")
+    provider = os.environ.get("STORAGE_PROVIDER", storage.get("default_provider", "backblaze")).strip().lower()
+    if provider not in storage.get("providers", {}):
+        supported = ", ".join(sorted(storage.get("providers", {})))
+        raise RuntimeError(f"unsupported STORAGE_PROVIDER={provider!r}; supported providers: {supported}")
+    return provider
+
+
+def storage_context() -> dict[str, str]:
+    storage = cfg("storage.json")
+    provider = storage_provider()
+    spec = storage["providers"][provider]
+
+    def required_env(name: str) -> str:
+        value = os.environ.get(name, "").strip()
+        if not value:
+            raise RuntimeError(f"required environment variable is missing: {name}")
+        return value
+
+    bucket = required_env(spec["bucket_env"])
+    access_key = required_env(spec["access_key_env"])
+    secret_key = required_env(spec["secret_key_env"])
+
+    if provider == "oracle":
+        region = required_env(spec["region_env"])
+        namespace = required_env(spec["namespace_env"])
+        endpoint = os.environ.get(spec["endpoint_env"], "").strip()
+        if not endpoint:
+            endpoint = f"https://{namespace}.compat.objectstorage.{region}.oci.customer-oci.com"
+    else:
+        endpoint = required_env(spec["endpoint_env"])
+        configured_region = os.environ.get(spec.get("region_env", ""), "").strip()
+        if configured_region:
+            region = configured_region
+        else:
+            host = endpoint.split("://", 1)[-1].split("/", 1)[0]
+            region = host[3:].split(".backblazeb2.com", 1)[0] if host.startswith("s3.") and ".backblazeb2.com" in host else spec.get("default_region", "us-east-1")
+
+    if not endpoint.startswith(("https://", "http://")):
+        raise RuntimeError(f"storage endpoint must include http:// or https://: {endpoint}")
+
+    return {
+        "provider": provider,
+        "bucket": bucket,
+        "endpoint": endpoint.rstrip("/"),
+        "access_key": access_key,
+        "secret_key": secret_key,
+        "region": region,
+    }
+
 def sha256(path: str | Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -74,24 +126,25 @@ def retry(
 
 
 def aws_env() -> dict[str, str]:
-    storage = cfg("storage.json")
+    context = storage_context()
     environment = os.environ.copy()
-    environment["AWS_ACCESS_KEY_ID"] = os.environ[storage["access_key_env"]]
-    environment["AWS_SECRET_ACCESS_KEY"] = os.environ[storage["secret_key_env"]]
-    environment["AWS_DEFAULT_REGION"] = environment.get("AWS_DEFAULT_REGION", "us-east-005")
+    environment["AWS_ACCESS_KEY_ID"] = context["access_key"]
+    environment["AWS_SECRET_ACCESS_KEY"] = context["secret_key"]
+    environment["AWS_DEFAULT_REGION"] = context["region"]
+    environment["AWS_EC2_METADATA_DISABLED"] = "true"
     return environment
 
 
 def endpoint() -> str:
-    return os.environ[cfg("storage.json")["endpoint_env"]]
+    return storage_context()["endpoint"]
 
 
 def s3_uri(object_name: str) -> str:
     storage = cfg("storage.json")
-    bucket = os.environ[storage["bucket_env"]]
+    context = storage_context()
     prefix = storage["remote_prefix"].strip("/")
     object_name = object_name.lstrip("/")
-    return f"s3://{bucket}/{prefix}/{object_name}" if prefix else f"s3://{bucket}/{object_name}"
+    return f"s3://{context['bucket']}/{prefix}/{object_name}" if prefix else f"s3://{context['bucket']}/{object_name}"
 
 
 def aws_cp(source: str, destination: str) -> subprocess.CompletedProcess[str]:
@@ -192,6 +245,15 @@ def build(args: argparse.Namespace) -> None:
 
     base.parent.mkdir(parents=True, exist_ok=True)
     base.unlink(missing_ok=True)
+
+    usage = shutil.disk_usage(base.parent)
+    log(
+        "host storage before image creation: "
+        f"total={usage.total // (1024**3)}GiB "
+        f"used={usage.used // (1024**3)}GiB "
+        f"free={usage.free // (1024**3)}GiB"
+    )
+
     run(["qemu-img", "create", "-f", "qcow2", base, args.disk_size])
 
     qmp_socket = ROOT / vm["qmp_socket"]
@@ -210,7 +272,8 @@ def build(args: argparse.Namespace) -> None:
         "-drive", f"if=pflash,format=raw,file={uefi_vars_destination}",
         "-drive", f"file={base},if=virtio,format=qcow2,cache=writeback,discard=unmap",
         "-cdrom", windows_iso,
-        "-drive", f"file={virtio_iso},media=cdrom,readonly=on",
+        "-drive", f"if=none,id=virtiocd,file={virtio_iso},format=raw,media=cdrom,readonly=on",
+        "-device", "ide-cd,drive=virtiocd",
         "-boot", "order=d,menu=on",
         "-netdev", "user,id=n0",
         "-device", "virtio-net-pci,netdev=n0",
@@ -231,7 +294,7 @@ def build(args: argparse.Namespace) -> None:
 
     compacted = base.with_suffix(".compact.qcow2")
     compacted.unlink(missing_ok=True)
-    run(["qemu-img", "convert", "-O", "qcow2", "-c", base, compacted])
+    run(["qemu-img", "convert", "-p", "-O", "qcow2", "-c", base, compacted])
     compacted.replace(base)
 
     digest = sha256(base)
@@ -315,7 +378,7 @@ def upload(_: argparse.Namespace) -> None:
         raise SystemExit(f"uploaded base verification failed: expected={digest} actual={verified_digest}")
 
     verification_copy.unlink(missing_ok=True)
-    log("base image uploaded and verified")
+    log(f"base image uploaded and verified using {storage_provider()}")
 
 
 def main() -> None:

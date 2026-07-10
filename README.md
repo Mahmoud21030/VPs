@@ -112,3 +112,40 @@ Run **Actions → build-base-image → Run workflow** with:
 - `virtio_iso_sha256`: optional checksum
 
 The workflow creates `work/base.qcow2`, verifies it with `qemu-img check`, writes `work/base.sha256` and `work/base-manifest.json`, uploads `base.qcow2`, `base.sha256`, and `base-manifest.json` to the configured Backblaze B2 prefix, then downloads `base.qcow2` again and verifies the uploaded SHA256.
+
+
+## Selectable object storage: Backblaze B2 or Oracle OCI
+
+Every manual workflow now has a `storage_provider` choice:
+
+- `backblaze`
+- `oracle`
+
+The selected provider is used consistently for the base image, overlays, checksums, manifests, checkpoint rotation, restore, and upload verification.
+
+### Backblaze GitHub secrets
+
+- `B2_BUCKET`
+- `B2_ENDPOINT` including `https://`
+- `B2_KEY_ID`
+- `B2_APPLICATION_KEY`
+- Optional: `B2_REGION`
+
+### Oracle OCI Object Storage GitHub secrets
+
+- `ORACLE_BUCKET`
+- `ORACLE_NAMESPACE`
+- `ORACLE_REGION`, for example `eu-frankfurt-1`
+- `ORACLE_ACCESS_KEY_ID` — OCI Customer Secret Key access key
+- `ORACLE_SECRET_ACCESS_KEY` — OCI Customer Secret Key secret value
+- Optional: `ORACLE_ENDPOINT`
+
+When `ORACLE_ENDPOINT` is omitted, the workflow derives:
+
+```text
+https://<namespace>.compat.objectstorage.<region>.oci.customer-oci.com
+```
+
+The same `storage_provider` value must be selected for base creation and later runtime/checkpoint workflows so they read and write the same object store.
+
+For scheduled maintenance, set the GitHub repository variable `STORAGE_PROVIDER` to `backblaze` or `oracle`; the default is `backblaze`.

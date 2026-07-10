@@ -6,6 +6,58 @@ WORK=ROOT/'work'; LOGS=ROOT/'logs'
 for p in (WORK, LOGS): p.mkdir(parents=True, exist_ok=True)
 def cfg(name):
     with open(ROOT/'config'/name, 'r', encoding='utf-8') as f: return json.load(f)
+
+def storage_provider() -> str:
+    storage = cfg("storage.json")
+    provider = os.environ.get("STORAGE_PROVIDER", storage.get("default_provider", "backblaze")).strip().lower()
+    if provider not in storage.get("providers", {}):
+        supported = ", ".join(sorted(storage.get("providers", {})))
+        raise RuntimeError(f"unsupported STORAGE_PROVIDER={provider!r}; supported providers: {supported}")
+    return provider
+
+
+def storage_context() -> dict[str, str]:
+    storage = cfg("storage.json")
+    provider = storage_provider()
+    spec = storage["providers"][provider]
+
+    def required_env(name: str) -> str:
+        value = os.environ.get(name, "").strip()
+        if not value:
+            raise RuntimeError(f"required environment variable is missing: {name}")
+        return value
+
+    bucket = required_env(spec["bucket_env"])
+    access_key = required_env(spec["access_key_env"])
+    secret_key = required_env(spec["secret_key_env"])
+
+    if provider == "oracle":
+        region = required_env(spec["region_env"])
+        namespace = required_env(spec["namespace_env"])
+        endpoint = os.environ.get(spec["endpoint_env"], "").strip()
+        if not endpoint:
+            endpoint = f"https://{namespace}.compat.objectstorage.{region}.oci.customer-oci.com"
+    else:
+        endpoint = required_env(spec["endpoint_env"])
+        configured_region = os.environ.get(spec.get("region_env", ""), "").strip()
+        if configured_region:
+            region = configured_region
+        else:
+            host = endpoint.split("://", 1)[-1].split("/", 1)[0]
+            region = host[3:].split(".backblazeb2.com", 1)[0] if host.startswith("s3.") and ".backblazeb2.com" in host else spec.get("default_region", "us-east-1")
+
+    if not endpoint.startswith(("https://", "http://")):
+        raise RuntimeError(f"storage endpoint must include http:// or https://: {endpoint}")
+
+    return {
+        "provider": provider,
+        "bucket": bucket,
+        "endpoint": endpoint.rstrip("/"),
+        "access_key": access_key,
+        "secret_key": secret_key,
+        "region": region,
+    }
+
 def log(msg):
     s=f"[{datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace('+00:00','Z').removesuffix('Z')}Z] {msg}"
     print(s, flush=True)
@@ -25,15 +77,22 @@ def verify_sha(path, sha_file):
     if expected!=got: raise SystemExit(f"checksum mismatch for {path}: expected {expected}, got {got}")
     log(f"sha256 verified: {path}")
 def aws_env():
-    s=cfg('storage.json');
-    env=os.environ.copy();
-    env['AWS_ACCESS_KEY_ID']=os.environ[s['access_key_env']]
-    env['AWS_SECRET_ACCESS_KEY']=os.environ[s['secret_key_env']]
-    env['AWS_DEFAULT_REGION']=env.get('AWS_DEFAULT_REGION','us-east-005')
+    context = storage_context()
+    env = os.environ.copy()
+    env['AWS_ACCESS_KEY_ID'] = context['access_key']
+    env['AWS_SECRET_ACCESS_KEY'] = context['secret_key']
+    env['AWS_DEFAULT_REGION'] = context['region']
+    env['AWS_EC2_METADATA_DISABLED'] = 'true'
     return env
+
 def s3_uri(obj):
-    s=cfg('storage.json'); return f"s3://{os.environ[s['bucket_env']]}/{s['remote_prefix'].strip('/')}/{obj.lstrip('/')}"
-def endpoint(): return os.environ[cfg('storage.json')['endpoint_env']]
+    s = cfg('storage.json')
+    context = storage_context()
+    prefix = s['remote_prefix'].strip('/')
+    object_name = obj.lstrip('/')
+    return f"s3://{context['bucket']}/{prefix}/{object_name}" if prefix else f"s3://{context['bucket']}/{object_name}"
+
+def endpoint(): return storage_context()['endpoint']
 def aws_cp(src,dst): return run(['aws','--endpoint-url',endpoint(),'s3','cp',src,dst,'--only-show-errors'], env=aws_env())
 def aws_ls(uri): return subprocess.run(['aws','--endpoint-url',endpoint(),'s3','ls',uri], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=aws_env()).returncode==0
 def aws_rm(uri): return run(['aws','--endpoint-url',endpoint(),'s3','rm',uri,'--only-show-errors'], env=aws_env(), check=False)

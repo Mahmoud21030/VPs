@@ -2,6 +2,14 @@ name: checkpoint
 on:
   workflow_dispatch:
     inputs:
+      storage_provider:
+        description: Object storage provider
+        required: true
+        default: backblaze
+        type: choice
+        options:
+          - backblaze
+          - oracle
       name:
         required: false
         default: latest
@@ -12,14 +20,29 @@ jobs:
   checkpoint:
     runs-on: ubuntu-latest
     env:
+      STORAGE_PROVIDER: ${{ inputs.storage_provider || vars.STORAGE_PROVIDER || 'backblaze' }}
       B2_BUCKET: ${{ secrets.B2_BUCKET }}
       B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
       B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
       B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+      B2_REGION: ${{ secrets.B2_REGION }}
+      ORACLE_BUCKET: ${{ secrets.ORACLE_BUCKET }}
+      ORACLE_NAMESPACE: ${{ secrets.ORACLE_NAMESPACE }}
+      ORACLE_REGION: ${{ secrets.ORACLE_REGION }}
+      ORACLE_ENDPOINT: ${{ secrets.ORACLE_ENDPOINT }}
+      ORACLE_ACCESS_KEY_ID: ${{ secrets.ORACLE_ACCESS_KEY_ID }}
+      ORACLE_SECRET_ACCESS_KEY: ${{ secrets.ORACLE_SECRET_ACCESS_KEY }}
     steps:
       - uses: actions/checkout@v4
       - run: scripts/bootstrap/install.sh
-      - run: scripts/backblaze/login
+      - run: scripts/storage/login
+      - name: Enable KVM access
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -e /dev/kvm
+          sudo chmod 666 /dev/kvm
+          test -r /dev/kvm -a -w /dev/kvm
       - run: scripts/restore/restore
       - run: scripts/qemu/boot
       - run: scripts/checkpoint/checkpoint "${{ inputs.name }}"

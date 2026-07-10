@@ -32,3 +32,37 @@ def test_rollback_candidate_order():
     s={'checkpoint_prefix':'checkpoints','rotation_count':3,'latest_object':'latest/overlay.qcow2.zst','latest_sha256_object':'latest/overlay.sha256'}
     candidates=[('latest',s['latest_object'],s['latest_sha256_object'])]+[(f'checkpoint{i}',f"{s['checkpoint_prefix'].strip('/')}/checkpoint{i}/overlay.qcow2.zst",f"{s['checkpoint_prefix'].strip('/')}/checkpoint{i}/overlay.sha256") for i in range(1,s.get('rotation_count',3)+1)]
     assert [c[0] for c in candidates] == ['latest','checkpoint1','checkpoint2','checkpoint3']
+
+
+def test_storage_provider_backblaze(monkeypatch):
+    monkeypatch.setenv('STORAGE_PROVIDER', 'backblaze')
+    monkeypatch.setenv('B2_BUCKET', 'bucket')
+    monkeypatch.setenv('B2_ENDPOINT', 'https://s3.eu-central-003.backblazeb2.com')
+    monkeypatch.setenv('B2_KEY_ID', 'key')
+    monkeypatch.setenv('B2_APPLICATION_KEY', 'secret')
+    monkeypatch.delenv('B2_REGION', raising=False)
+    context = libvm.storage_context()
+    assert context['provider'] == 'backblaze'
+    assert context['region'] == 'eu-central-003'
+    assert context['endpoint'] == 'https://s3.eu-central-003.backblazeb2.com'
+
+
+def test_storage_provider_oracle_derives_endpoint(monkeypatch):
+    monkeypatch.setenv('STORAGE_PROVIDER', 'oracle')
+    monkeypatch.setenv('ORACLE_BUCKET', 'vm-bucket')
+    monkeypatch.setenv('ORACLE_NAMESPACE', 'mytenancynamespace')
+    monkeypatch.setenv('ORACLE_REGION', 'eu-frankfurt-1')
+    monkeypatch.setenv('ORACLE_ACCESS_KEY_ID', 'access')
+    monkeypatch.setenv('ORACLE_SECRET_ACCESS_KEY', 'secret')
+    monkeypatch.delenv('ORACLE_ENDPOINT', raising=False)
+    context = libvm.storage_context()
+    assert context['provider'] == 'oracle'
+    assert context['endpoint'] == 'https://mytenancynamespace.compat.objectstorage.eu-frankfurt-1.oci.customer-oci.com'
+    assert context['region'] == 'eu-frankfurt-1'
+
+
+def test_storage_provider_rejects_unknown(monkeypatch):
+    monkeypatch.setenv('STORAGE_PROVIDER', 'unknown')
+    import pytest
+    with pytest.raises(RuntimeError):
+        libvm.storage_context()

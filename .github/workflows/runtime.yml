@@ -3,6 +3,14 @@ name: runtime
 on:
   workflow_dispatch:
     inputs:
+      storage_provider:
+        description: Object storage provider
+        required: true
+        default: backblaze
+        type: choice
+        options:
+          - backblaze
+          - oracle
       memory_mb:
         description: VM memory in MB
         required: false
@@ -24,10 +32,18 @@ jobs:
     timeout-minutes: 360
 
     env:
+      STORAGE_PROVIDER: ${{ inputs.storage_provider || vars.STORAGE_PROVIDER || 'backblaze' }}
       B2_BUCKET: ${{ secrets.B2_BUCKET }}
       B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
       B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
       B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+      B2_REGION: ${{ secrets.B2_REGION }}
+      ORACLE_BUCKET: ${{ secrets.ORACLE_BUCKET }}
+      ORACLE_NAMESPACE: ${{ secrets.ORACLE_NAMESPACE }}
+      ORACLE_REGION: ${{ secrets.ORACLE_REGION }}
+      ORACLE_ENDPOINT: ${{ secrets.ORACLE_ENDPOINT }}
+      ORACLE_ACCESS_KEY_ID: ${{ secrets.ORACLE_ACCESS_KEY_ID }}
+      ORACLE_SECRET_ACCESS_KEY: ${{ secrets.ORACLE_SECRET_ACCESS_KEY }}
 
     steps:
       - name: Checkout repository
@@ -71,8 +87,8 @@ jobs:
           ls -l /dev/kvm
           echo "KVM access enabled successfully"
 
-      - name: Authenticate Backblaze B2
-        run: scripts/backblaze/login
+      - name: Authenticate selected object storage
+        run: scripts/storage/login
 
       - name: Connect runner to Tailscale
         uses: tailscale/github-action@v4
@@ -105,6 +121,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           echo "============================================================"
+          echo "Storage provider: $STORAGE_PROVIDER"
           echo "WINDOWS VM CONNECTION INFORMATION"
           echo
           echo "RDP: ${TS_IP}:3389"
@@ -115,49 +132,7 @@ jobs:
           echo "============================================================"
 
           tailscale status
-          
-      - name: Diagnose Backblaze access
-        shell: bash
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_APPLICATION_KEY }}
-          AWS_DEFAULT_REGION: us-east-1
-          AWS_EC2_METADATA_DISABLED: "true"
-        run: |
-          set -Eeuo pipefail
 
-          echo "Bucket: $B2_BUCKET"
-          echo "Endpoint host: $(echo "$B2_ENDPOINT" | sed 's#https\?://##')"
-          echo "Key ID prefix: ${B2_KEY_ID:0:10}..."
-
-          echo
-          echo "=== Test bucket access ==="
-          aws \
-            --endpoint-url "$B2_ENDPOINT" \
-            s3api head-bucket \
-            --bucket "$B2_BUCKET"
-
-          echo
-          echo "=== List windows-vm objects ==="
-          aws \
-            --endpoint-url "$B2_ENDPOINT" \
-            s3api list-objects-v2 \
-            --bucket "$B2_BUCKET" \
-            --prefix "windows-vm/" \
-            --query 'Contents[].{Key:Key,Size:Size}' \
-            --output table
-
-          echo
-          echo "=== Test base image metadata ==="
-          aws \
-            --endpoint-url "$B2_ENDPOINT" \
-            s3api head-object \
-            --bucket "$B2_BUCKET" \
-            --key "windows-vm/base.qcow2"
-
-          echo
-          echo "Backblaze access test successful."
-          
       - name: Restore persistent VM
         run: scripts/restore/restore
 

@@ -3,6 +3,14 @@ name: build-base-image-vnc
 on:
   workflow_dispatch:
     inputs:
+      storage_provider:
+        description: Object storage provider
+        required: true
+        default: backblaze
+        type: choice
+        options:
+          - backblaze
+          - oracle
       windows_iso_url:
         description: Direct HTTPS URL to Windows ISO
         required: true
@@ -15,9 +23,9 @@ on:
         type: string
 
       disk_size:
-        description: Virtual disk size
+        description: Virtual Windows disk size (sparse QCOW2)
         required: false
-        default: 80G
+        default: 220G
         type: string
 
       memory_mb:
@@ -35,7 +43,7 @@ on:
       install_timeout_minutes:
         description: Maximum time to wait for manual Windows installation and shutdown
         required: false
-        default: "180"
+        default: "210"
         type: string
 
       windows_iso_sha256:
@@ -60,10 +68,18 @@ jobs:
     timeout-minutes: 240
 
     env:
+      STORAGE_PROVIDER: ${{ inputs.storage_provider || vars.STORAGE_PROVIDER || 'backblaze' }}
       B2_BUCKET: ${{ secrets.B2_BUCKET }}
       B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
       B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
       B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+      B2_REGION: ${{ secrets.B2_REGION }}
+      ORACLE_BUCKET: ${{ secrets.ORACLE_BUCKET }}
+      ORACLE_NAMESPACE: ${{ secrets.ORACLE_NAMESPACE }}
+      ORACLE_REGION: ${{ secrets.ORACLE_REGION }}
+      ORACLE_ENDPOINT: ${{ secrets.ORACLE_ENDPOINT }}
+      ORACLE_ACCESS_KEY_ID: ${{ secrets.ORACLE_ACCESS_KEY_ID }}
+      ORACLE_SECRET_ACCESS_KEY: ${{ secrets.ORACLE_SECRET_ACCESS_KEY }}
 
     steps:
       - name: Checkout repository
@@ -90,8 +106,8 @@ jobs:
             exit 1
           fi
 
-      - name: Authenticate Backblaze B2
-        run: scripts/backblaze/login
+      - name: Authenticate selected object storage
+        run: scripts/storage/login
 
       - name: Connect runner to Tailscale
         uses: tailscale/github-action@v4
@@ -121,6 +137,7 @@ jobs:
         run: |
           set -Eeuo pipefail
 
+          echo "Storage provider: $STORAGE_PROVIDER"
           echo "Starting QEMU base-image builder"
           echo "VNC address: ${{ steps.vnc.outputs.tailscale_ip }}:5900"
           echo "Install Windows manually, then shut Windows down normally."
@@ -165,8 +182,8 @@ jobs:
 
           wait "$BUILD_PID"
 
-      - name: Upload base image to Backblaze B2
-        run: scripts/backblaze/upload-base
+      - name: Upload base image to selected object storage
+        run: scripts/storage/upload-base
 
       - name: Upload build logs
         if: always()

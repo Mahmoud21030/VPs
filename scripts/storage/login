@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+source "$(dirname "$0")/../common.sh"
+
+provider="${STORAGE_PROVIDER:-backblaze}"
+case "$provider" in
+  backblaze)
+    : "${B2_BUCKET:?B2_BUCKET is required}"
+    : "${B2_ENDPOINT:?B2_ENDPOINT is required}"
+    : "${B2_KEY_ID:?B2_KEY_ID is required}"
+    : "${B2_APPLICATION_KEY:?B2_APPLICATION_KEY is required}"
+    endpoint="$B2_ENDPOINT"
+    bucket="$B2_BUCKET"
+    access_key="$B2_KEY_ID"
+    secret_key="$B2_APPLICATION_KEY"
+    if [[ -n "${B2_REGION:-}" ]]; then
+      region="$B2_REGION"
+    else
+      host="${endpoint#*://}"
+      host="${host%%/*}"
+      region="${host#s3.}"
+      region="${region%%.backblazeb2.com}"
+      [[ "$region" == "$host" ]] && region="us-east-1"
+    fi
+    ;;
+  oracle)
+    : "${ORACLE_BUCKET:?ORACLE_BUCKET is required}"
+    : "${ORACLE_NAMESPACE:?ORACLE_NAMESPACE is required}"
+    : "${ORACLE_REGION:?ORACLE_REGION is required}"
+    : "${ORACLE_ACCESS_KEY_ID:?ORACLE_ACCESS_KEY_ID is required}"
+    : "${ORACLE_SECRET_ACCESS_KEY:?ORACLE_SECRET_ACCESS_KEY is required}"
+    endpoint="${ORACLE_ENDPOINT:-https://${ORACLE_NAMESPACE}.compat.objectstorage.${ORACLE_REGION}.oci.customer-oci.com}"
+    bucket="$ORACLE_BUCKET"
+    access_key="$ORACLE_ACCESS_KEY_ID"
+    secret_key="$ORACLE_SECRET_ACCESS_KEY"
+    region="$ORACLE_REGION"
+    ;;
+  *)
+    echo "Unsupported STORAGE_PROVIDER: $provider" >&2
+    exit 2
+    ;;
+esac
+
+case "$endpoint" in
+  http://*|https://*) ;;
+  *) echo "Storage endpoint must include https:// or http://: $endpoint" >&2; exit 2 ;;
+esac
+
+export AWS_ACCESS_KEY_ID="$access_key"
+export AWS_SECRET_ACCESS_KEY="$secret_key"
+export AWS_DEFAULT_REGION="$region"
+export AWS_EC2_METADATA_DISABLED=true
+
+if [[ "$provider" == "backblaze" ]]; then
+  aws --endpoint-url "$endpoint" s3 ls "s3://$bucket" >/dev/null
+else
+  aws --endpoint-url "$endpoint" s3api head-bucket --bucket "$bucket" >/dev/null
+fi
+log "storage authentication verified: provider=$provider bucket=$bucket endpoint=$endpoint region=$region"
