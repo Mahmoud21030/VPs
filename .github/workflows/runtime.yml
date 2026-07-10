@@ -14,7 +14,7 @@ on:
       memory_mb:
         description: VM memory in MB
         required: false
-        default: "8192"
+        default: "15360"
         type: string
       cpu_cores:
         description: Number of virtual CPU cores
@@ -31,7 +31,7 @@ on:
       checkpoint_interval_minutes:
         description: Automatic checkpoint interval in minutes
         required: false
-        default: "15"
+        default: "30"
         type: string
 
       virtio_iso_url:
