@@ -1,4 +1,29 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 source "$(dirname "$0")/../common.sh"
-python3 "$ROOT_DIR/scripts/libvm.py" checkpoint --name latest || true
+
+log "cleanup started"
+
+# Stop the background checkpoint loop so it cannot race with the final save.
+if [[ -f "$WORK_DIR/checkpoint-loop.pid" ]]; then
+    CHECKPOINT_LOOP_PID="$(cat "$WORK_DIR/checkpoint-loop.pid" 2>/dev/null || true)"
+
+    if [[ -n "$CHECKPOINT_LOOP_PID" ]]; then
+        log "stopping checkpoint loop PID $CHECKPOINT_LOOP_PID"
+        kill "$CHECKPOINT_LOOP_PID" 2>/dev/null || true
+        wait "$CHECKPOINT_LOOP_PID" 2>/dev/null || true
+    fi
+
+    rm -f "$WORK_DIR/checkpoint-loop.pid"
+fi
+
+OVERLAY_PATH="$ROOT_DIR/$(jq -r '.overlay_image' "$ROOT_DIR/config/vm.json")"
+
+if [[ ! -f "$OVERLAY_PATH" ]]; then
+    log "no overlay exists; nothing to save"
+    exit 0
+fi
+
+log "starting final latest checkpoint"
+python3 "$ROOT_DIR/scripts/libvm.py" checkpoint --name latest
+log "final latest checkpoint completed successfully"

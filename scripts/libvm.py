@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import fcntl
 import argparse, datetime, hashlib, json, os, re, shutil, socket, subprocess, sys, time
 from pathlib import Path
 ROOT=Path(os.environ.get('ROOT_DIR', Path(__file__).resolve().parents[1]))
@@ -261,6 +262,40 @@ def wait_rdp(timeout=900):
         if rc==0: log('rdp ready'); return
         time.sleep(5)
     raise SystemExit('rdp did not become ready')
+def qemu_pid(v=None):
+    v = v or cfg('vm.json')
+    pid_file = ROOT / v['pid_file']
+
+    try:
+        text = pid_file.read_text(encoding='utf-8').strip()
+        return int(text)
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+
+def qemu_is_running(v=None):
+    v = v or cfg('vm.json')
+    pid = qemu_pid(v)
+
+    if pid is None:
+        return False
+
+    return subprocess.run(
+        ['kill', '-0', str(pid)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+def wait_for_qemu_exit(v=None, timeout=30):
+    v = v or cfg('vm.json')
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        if not qemu_is_running(v):
+            return True
+        time.sleep(1)
+
+    return not qemu_is_running(v)
+
 def shutdown():
     try: qmp_cmd('system_powerdown'); log('qmp system_powerdown sent')
     except Exception as e: log(f'qmp shutdown failed: {e}')
@@ -272,33 +307,176 @@ def shutdown():
             time.sleep(5)
         raise SystemExit('qemu did not exit after ACPI shutdown')
 def checkpoint(name='latest'):
-    v=cfg('vm.json'); s=cfg('storage.json'); c=cfg('checkpoint.json'); overlay=ROOT/v['overlay_image']; comp=ROOT/v['overlay_compressed']; sha=WORK/'overlay.sha256'
-    if not overlay.exists(): raise SystemExit('overlay missing')
-    try: qmp_cmd('guest-fsfreeze-freeze'); frozen=True; log('guest fs frozen')
-    except Exception as e: frozen=False; log(f'guest fs freeze unavailable: {e}')
-    qmp_cmd('stop'); log('vm paused')
-    try:
-        run(['qemu-img','check','-r','leaks',overlay], check=False)
-        run(['qemu-img','convert','-O','qcow2','-c',overlay,str(overlay)+'.compact'])
-        Path(str(overlay)+'.compact').replace(overlay); log('overlay compacted')
-        compress(overlay, comp); digest=write_sha(comp, sha)
-        manifest={'version':1,'created_utc':datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace('+00:00','Z'),'name':name,'sha256':digest,'compressed':'overlay.qcow2.zst','base_object':s['base_object']}
-        (WORK/'manifest.json').write_text(json.dumps(manifest,indent=2), encoding='utf-8')
-        if name=='latest':
-            targets=[(s['latest_object'],comp),(s['latest_sha256_object'],sha),(s['manifest_object'],WORK/'manifest.json')]
+    v = cfg('vm.json')
+    s = cfg('storage.json')
+    c = cfg('checkpoint.json')
+
+    overlay = ROOT / v['overlay_image']
+    comp = ROOT / v['overlay_compressed']
+    sha = WORK / 'overlay.sha256'
+    qmp_socket = ROOT / v['qmp_socket']
+    lock_path = WORK / 'checkpoint.lock'
+
+    if not overlay.exists():
+        raise SystemExit('overlay missing')
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(lock_path, 'a+', encoding='utf-8') as lock_file:
+        log('waiting for checkpoint lock')
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        log('checkpoint lock acquired')
+
+        frozen = False
+        paused = False
+        online_checkpoint = qemu_is_running(v) and qmp_socket.exists()
+
+        if online_checkpoint:
+            log('QEMU is running; creating online checkpoint')
+
+            try:
+                qmp_cmd('guest-fsfreeze-freeze')
+                frozen = True
+                log('guest fs frozen')
+            except Exception as e:
+                log(f'guest fs freeze unavailable: {e}')
+
+            try:
+                qmp_cmd('stop')
+                paused = True
+                log('vm paused')
+            except Exception as e:
+                # A shutdown may finish between the running check and QMP stop.
+                if wait_for_qemu_exit(v, timeout=10):
+                    online_checkpoint = False
+                    paused = False
+                    frozen = False
+                    log(
+                        'QEMU exited while checkpoint was starting; '
+                        'continuing with safe offline checkpoint'
+                    )
+                else:
+                    raise RuntimeError(
+                        f'could not pause running VM for checkpoint: {e}'
+                    ) from e
         else:
-            pref=f"{s['checkpoint_prefix'].strip('/')}/{name}"; targets=[(f'{pref}/overlay.qcow2.zst',comp),(f'{pref}/overlay.sha256',sha),(f'{pref}/manifest.json',WORK/'manifest.json')]
-        for obj,path in targets:
-            retry(c['upload_retries'], c['retry_initial_seconds'], c['retry_max_seconds'], aws_cp, str(path), s3_uri(obj))
-        tmp=WORK/'verify-download.zst'; tmp.unlink(missing_ok=True)
-        retry(c['download_retries'], c['retry_initial_seconds'], c['retry_max_seconds'], aws_cp, s3_uri(targets[0][0]), str(tmp))
-        if sha256(tmp)!=digest: raise SystemExit('upload verification checksum mismatch')
-        log(f'checkpoint uploaded and verified: {name}')
-    finally:
-        qmp_cmd('cont'); log('vm resumed')
-        if frozen:
-            try: qmp_cmd('guest-fsfreeze-thaw'); log('guest fs thawed')
-            except Exception as e: log(f'guest fs thaw failed: {e}')
+            log(
+                'QEMU is not running or QMP socket is absent; '
+                'creating offline checkpoint from the stopped VM overlay'
+            )
+
+        try:
+            # Never copy/compact an actively running, unpaused overlay.
+            if qemu_is_running(v) and not paused:
+                raise RuntimeError(
+                    'refusing to checkpoint because QEMU is still running '
+                    'but the VM could not be paused'
+                )
+
+            run(['qemu-img', 'check', '-r', 'leaks', overlay], check=False)
+
+            compact = Path(str(overlay) + '.compact')
+            compact.unlink(missing_ok=True)
+
+            run([
+                'qemu-img',
+                'convert',
+                '-p',
+                '-O', 'qcow2',
+                '-c',
+                overlay,
+                compact,
+            ])
+
+            compact.replace(overlay)
+            log('overlay compacted')
+
+            compress(overlay, comp)
+            digest = write_sha(comp, sha)
+
+            manifest = {
+                'version': 1,
+                'created_utc': datetime.datetime.now(
+                    datetime.timezone.utc
+                ).replace(
+                    microsecond=0
+                ).isoformat().replace('+00:00', 'Z'),
+                'name': name,
+                'sha256': digest,
+                'compressed': 'overlay.qcow2.zst',
+                'base_object': s['base_object'],
+                'checkpoint_mode': (
+                    'online-paused' if paused else 'offline-stopped'
+                ),
+            }
+
+            (WORK / 'manifest.json').write_text(
+                json.dumps(manifest, indent=2),
+                encoding='utf-8',
+            )
+
+            if name == 'latest':
+                targets = [
+                    (s['latest_object'], comp),
+                    (s['latest_sha256_object'], sha),
+                    (s['manifest_object'], WORK / 'manifest.json'),
+                ]
+            else:
+                pref = f"{s['checkpoint_prefix'].strip('/')}/{name}"
+                targets = [
+                    (f'{pref}/overlay.qcow2.zst', comp),
+                    (f'{pref}/overlay.sha256', sha),
+                    (f'{pref}/manifest.json', WORK / 'manifest.json'),
+                ]
+
+            for obj, path in targets:
+                retry(
+                    c['upload_retries'],
+                    c['retry_initial_seconds'],
+                    c['retry_max_seconds'],
+                    aws_cp,
+                    str(path),
+                    s3_uri(obj),
+                )
+
+            tmp = WORK / 'verify-download.zst'
+            tmp.unlink(missing_ok=True)
+
+            retry(
+                c['download_retries'],
+                c['retry_initial_seconds'],
+                c['retry_max_seconds'],
+                aws_cp,
+                s3_uri(targets[0][0]),
+                str(tmp),
+            )
+
+            if sha256(tmp) != digest:
+                raise SystemExit('upload verification checksum mismatch')
+
+            log(
+                f'checkpoint uploaded and verified: {name} '
+                f'({"online-paused" if paused else "offline-stopped"})'
+            )
+        finally:
+            # Only resume/thaw when QEMU still exists and was actually paused.
+            if paused and qemu_is_running(v) and qmp_socket.exists():
+                if frozen:
+                    try:
+                        qmp_cmd('guest-fsfreeze-thaw')
+                        log('guest fs thawed')
+                    except Exception as e:
+                        log(f'guest fs thaw failed: {e}')
+
+                try:
+                    qmp_cmd('cont')
+                    log('vm resumed')
+                except Exception as e:
+                    log(f'vm resume unavailable because QEMU is exiting: {e}')
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            log('checkpoint lock released')
+
 def rotate():
     s=cfg('storage.json');
     for i in range(s.get('rotation_count',3),0,-1):

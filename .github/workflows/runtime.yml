@@ -364,7 +364,7 @@ jobs:
           echo $! > work/checkpoint-loop.pid
           echo "Checkpoint loop started with PID $(cat work/checkpoint-loop.pid)"
 
-      - name: Keep runtime alive
+      - name: Keep runtime alive until Windows shuts down
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -374,25 +374,34 @@ jobs:
           echo
           echo "RDP: ${{ steps.tailscale.outputs.ip }}:3389"
           echo "VNC: ${{ steps.tailscale.outputs.ip }}:5900"
+          echo
+          echo "When Windows shuts down normally, the workflow will:"
+          echo "  1. Detect that QEMU exited"
+          echo "  2. Create an offline checkpoint"
+          echo "  3. Upload and verify latest persistent state"
           echo "============================================================"
 
-          if [[ ! -f work/qemu.pid ]]; then
-            echo "::error::QEMU PID file is missing"
-            exit 1
-          fi
-
           while true; do
-            sleep 60
+            sleep 15
 
-            QEMU_PID="$(cat work/qemu.pid)"
+            QEMU_PID="$(cat work/qemu.pid 2>/dev/null || true)"
+
+            if [[ -z "$QEMU_PID" ]]; then
+              echo "QEMU PID file disappeared after Windows shutdown."
+              echo "Runtime is ending normally so cleanup can save the stopped overlay."
+              exit 0
+            fi
+
             if ! kill -0 "$QEMU_PID" 2>/dev/null; then
-              echo "QEMU has exited. Runtime step is ending."
+              echo "QEMU process $QEMU_PID has exited."
+              echo "Runtime is ending normally so cleanup can save the stopped overlay."
               exit 0
             fi
           done
 
-      - name: Cleanup checkpoint
+      - name: Save final checkpoint after shutdown or workflow exit
         if: always()
+        timeout-minutes: 90
         run: scripts/cleanup/cleanup
 
       - name: Upload runtime logs
