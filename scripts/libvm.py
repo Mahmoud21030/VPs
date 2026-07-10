@@ -102,7 +102,25 @@ def s3_uri(obj):
     return f"s3://{context['bucket']}/{prefix}/{object_name}" if prefix else f"s3://{context['bucket']}/{object_name}"
 
 def endpoint(): return storage_context()['endpoint']
-def aws_cp(src,dst): return run(['aws','--endpoint-url',endpoint(),'s3','cp',src,dst,'--only-show-errors'], env=aws_env())
+def aws_cp(src, dst):
+    cmd = [
+        'aws',
+        '--endpoint-url', endpoint(),
+        's3', 'cp',
+        src, dst,
+        '--only-show-errors',
+    ]
+
+    # AWS CLI v2 tries to preserve tags and metadata during S3-to-S3
+    # multipart copies. That can trigger HeadObject/GetObjectTagging/
+    # PutObjectTagging calls, which are not supported by every S3-
+    # compatible provider. For checkpoint rotation we only need the
+    # object bytes, so disable property copying explicitly.
+    if str(src).startswith('s3://') and str(dst).startswith('s3://'):
+        cmd.extend(['--copy-props', 'none'])
+        log(f'remote object copy without tags/metadata: {src} -> {dst}')
+
+    return run(cmd, env=aws_env())
 def aws_ls(uri): return subprocess.run(['aws','--endpoint-url',endpoint(),'s3','ls',uri], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=aws_env()).returncode==0
 def aws_rm(uri): return run(['aws','--endpoint-url',endpoint(),'s3','rm',uri,'--only-show-errors'], env=aws_env(), check=False)
 def compress(src,dst):
