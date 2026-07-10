@@ -147,13 +147,15 @@ def qmp_cmd(cmd,args=None):
     with QMP(ROOT/v['qmp_socket'], c.get('qmp_timeout_seconds',20)) as q: return q.cmd(cmd,args)
 def boot():
     v=cfg('vm.json'); base=ROOT/v['base_image']; overlay=ROOT/v['overlay_image']
+    virtio_iso=WORK/'virtio-win.iso'
     if not base.exists(): raise SystemExit(f"missing base image: {base}")
+    if not virtio_iso.exists(): raise SystemExit(f"missing VirtIO driver ISO: {virtio_iso}")
     create_overlay(base, overlay)
     vars_path=ROOT/v['uefi_vars']
     if not vars_path.exists(): shutil.copyfile(v['uefi_vars_template'], vars_path)
     sock=ROOT/v['qmp_socket']; sock.unlink(missing_ok=True)
     pid=ROOT/v['pid_file']; pid.unlink(missing_ok=True)
-    cmd=['qemu-system-x86_64','-enable-kvm','-machine','q35,accel=kvm','-m',str(v['memory_mb']),'-smp',str(v['cpu_cores']),'-cpu','host','-drive',f"if=pflash,format=raw,readonly=on,file={v['uefi_code']}",'-drive',f"if=pflash,format=raw,file={vars_path}",'-drive',f"file={overlay},if=virtio,format=qcow2,cache=writeback,discard=unmap,id={v['disk_id']}",'-netdev',f"user,id={v['network_user_id']},hostfwd=tcp::%s-:%s"%(v['rdp_host_port'],v['rdp_guest_port']),'-device',f"virtio-net-pci,netdev={v['network_user_id']}",'-qmp',f"unix:{sock},server=on,wait=off",'-pidfile',str(pid),'-daemonize','-vnc',f"{v.get('vnc_listen','0.0.0.0')}:{v.get('vnc_display',0)}",'-serial','file:'+str(ROOT/v['monitor_log'])]
+    cmd=['qemu-system-x86_64','-enable-kvm','-machine','q35,accel=kvm','-m',str(v['memory_mb']),'-smp',str(v['cpu_cores']),'-cpu','host','-drive',f"if=pflash,format=raw,readonly=on,file={v['uefi_code']}",'-drive',f"if=pflash,format=raw,file={vars_path}",'-drive',f"file={overlay},if=virtio,format=qcow2,cache=writeback,discard=unmap,id={v['disk_id']}",'-drive',f"if=none,id=virtiocd,file={virtio_iso},format=raw,media=cdrom,readonly=on",'-device','ide-cd,drive=virtiocd','-netdev',f"user,id={v['network_user_id']},hostfwd=tcp::%s-:%s"%(v['rdp_host_port'],v['rdp_guest_port']),'-device',f"virtio-net-pci,netdev={v['network_user_id']}",'-qmp',f"unix:{sock},server=on,wait=off",'-pidfile',str(pid),'-daemonize','-vnc',f"{v.get('vnc_listen','0.0.0.0')}:{v.get('vnc_display',0)}",'-serial','file:'+str(ROOT/v['monitor_log'])]
     run(cmd); log('qemu started')
 def wait_rdp(timeout=900):
     port=cfg('vm.json')['rdp_host_port']; end=time.time()+timeout

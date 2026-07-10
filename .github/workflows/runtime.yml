@@ -22,6 +22,18 @@ on:
         default: "4"
         type: string
 
+      virtio_iso_url:
+        description: Direct HTTPS URL to the VirtIO Windows driver ISO
+        required: false
+        default: https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso
+        type: string
+
+      virtio_iso_sha256:
+        description: Optional SHA256 checksum for the VirtIO ISO
+        required: false
+        default: ""
+        type: string
+
 concurrency:
   group: windows-vm-runtime
   cancel-in-progress: false
@@ -117,6 +129,7 @@ jobs:
             echo
             echo "- **RDP:** \`${TS_IP}:3389\`"
             echo "- **Emergency VNC console:** \`${TS_IP}:5900\`"
+            echo "- **VirtIO driver CD:** mounted automatically inside Windows"
             echo "- VNC authentication: none"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -135,6 +148,48 @@ jobs:
 
       - name: Restore persistent VM
         run: scripts/restore/restore
+
+      - name: Download VirtIO driver ISO
+        shell: bash
+        env:
+          VIRTIO_ISO_URL: ${{ inputs.virtio_iso_url }}
+          VIRTIO_ISO_SHA256: ${{ inputs.virtio_iso_sha256 }}
+        run: |
+          set -Eeuo pipefail
+
+          mkdir -p work
+
+          final_path="work/virtio-win.iso"
+          temp_path="${final_path}.part"
+
+          rm -f "$temp_path"
+
+          echo "Downloading VirtIO Windows driver ISO..."
+          curl             --fail             --location             --retry 5             --retry-delay 3             --retry-all-errors             --progress-bar             "$VIRTIO_ISO_URL"             --output "$temp_path"
+
+          if [[ -n "${VIRTIO_ISO_SHA256:-}" ]]; then
+            expected="$(printf '%s' "$VIRTIO_ISO_SHA256" | tr '[:upper:]' '[:lower:]')"
+
+            if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::virtio_iso_sha256 must contain exactly 64 hexadecimal characters"
+              exit 1
+            fi
+
+            actual="$(sha256sum "$temp_path" | awk '{print $1}')"
+
+            echo "Expected SHA256: $expected"
+            echo "Actual SHA256:   $actual"
+
+            if [[ "$actual" != "$expected" ]]; then
+              echo "::error::VirtIO ISO SHA256 verification failed"
+              exit 1
+            fi
+          fi
+
+          mv "$temp_path" "$final_path"
+
+          echo "VirtIO ISO ready:"
+          ls -lh "$final_path"
 
       - name: Boot Windows VM
         run: scripts/qemu/boot
