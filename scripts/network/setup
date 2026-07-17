@@ -5,6 +5,16 @@ source "$(dirname "$0")/../common.sh"
 provider="${NETWORK_PROVIDER:-tailscale}"
 output_file="${GITHUB_OUTPUT:-/dev/null}"
 environment_file="${GITHUB_ENV:-/dev/null}"
+enable_ubuntu_ssh="${ENABLE_UBUNTU_SSH:-false}"
+
+if [[ "$enable_ubuntu_ssh" != "true" && "$enable_ubuntu_ssh" != "false" ]]; then
+  echo "ENABLE_UBUNTU_SSH must be true or false" >&2
+  exit 2
+fi
+if [[ "$enable_ubuntu_ssh" == "true" && "$provider" != "pinggy" ]]; then
+  echo "Ubuntu SSH access currently requires network_provider=pinggy" >&2
+  exit 2
+fi
 
 write_address() {
   local address="$1"
@@ -24,6 +34,69 @@ validate_port() {
     echo "$name must be an integer from 1024 through 65535" >&2
     exit 2
   fi
+}
+
+start_ubuntu_sshd() {
+  : "${UBUNTU_SSH_PASSWORD:?UBUNTU_SSH_PASSWORD secret is required when Ubuntu SSH is enabled}"
+  if (( ${#UBUNTU_SSH_PASSWORD} < 16 )); then
+    echo "UBUNTU_SSH_PASSWORD must contain at least 16 characters" >&2
+    exit 2
+  fi
+  if [[ "$UBUNTU_SSH_PASSWORD" == *:* || "$UBUNTU_SSH_PASSWORD" == *$'\n'* || "$UBUNTU_SSH_PASSWORD" == *$'\r'* ]]; then
+    echo "UBUNTU_SSH_PASSWORD must not contain colons or line breaks" >&2
+    exit 2
+  fi
+
+  if ! command -v /usr/sbin/sshd >/dev/null 2>&1; then
+    log "installing OpenSSH server for the opt-in Ubuntu terminal"
+    sudo apt-get update
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server
+  fi
+
+  if ! id vmadmin >/dev/null 2>&1; then
+    sudo useradd --create-home --shell /bin/bash --groups sudo vmadmin
+  fi
+  printf 'vmadmin:%s\n' "$UBUNTU_SSH_PASSWORD" | sudo chpasswd
+
+  sshd_dir="$WORK_DIR/ubuntu-sshd"
+  install -d -m 0700 "$sshd_dir"
+  ssh-keygen -q -t ed25519 -N '' -f "$sshd_dir/ssh_host_ed25519_key"
+  ssh-keygen -q -t rsa -b 3072 -N '' -f "$sshd_dir/ssh_host_rsa_key"
+  sudo install -d -m 0755 /run/sshd
+  cat > "$sshd_dir/sshd_config" <<EOF
+Port 2222
+ListenAddress 127.0.0.1
+HostKey $sshd_dir/ssh_host_ed25519_key
+HostKey $sshd_dir/ssh_host_rsa_key
+PidFile $sshd_dir/sshd.pid
+PasswordAuthentication yes
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+PermitRootLogin no
+AllowUsers vmadmin
+UsePAM yes
+MaxAuthTries 3
+LoginGraceTime 30
+AllowTcpForwarding no
+AllowAgentForwarding no
+X11Forwarding no
+PermitTunnel no
+ClientAliveInterval 60
+ClientAliveCountMax 3
+Subsystem sftp internal-sftp
+EOF
+  /usr/sbin/sshd -t -f "$sshd_dir/sshd_config"
+  sudo /usr/sbin/sshd -f "$sshd_dir/sshd_config"
+
+  for _ in $(seq 1 30); do
+    if nc -z 127.0.0.1 2222 2>/dev/null; then
+      log "Ubuntu SSH server ready: user=vmadmin local_port=2222"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "Ubuntu SSH server did not become ready on port 2222" >&2
+  exit 1
 }
 
 case "$provider" in
@@ -147,6 +220,10 @@ case "$provider" in
     pinggy_dir="$WORK_DIR/pinggy"
     install -d -m 0700 "$pinggy_dir"
 
+    if [[ "$enable_ubuntu_ssh" == "true" ]]; then
+      start_ubuntu_sshd
+    fi
+
     start_pinggy_tunnel() {
       local name="$1" local_port="$2"
       local log_file pid_file pid endpoint=""
@@ -187,6 +264,9 @@ case "$provider" in
 
     start_pinggy_tunnel rdp 3389
     start_pinggy_tunnel vnc 5900
+    if [[ "$enable_ubuntu_ssh" == "true" ]]; then
+      start_pinggy_tunnel ubuntu_ssh 2222
+    fi
     write_address 127.0.0.1
     ;;
 

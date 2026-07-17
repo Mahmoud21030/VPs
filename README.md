@@ -37,6 +37,7 @@ SSH reverse-relay alternative:
 - `SSH_RELAY_PRIVATE_KEY`
 - `SSH_RELAY_KNOWN_HOSTS`
 - `VNC_PASSWORD` (required for public Pinggy VNC; QEMU VNC uses its first 8 characters)
+- `UBUNTU_SSH_PASSWORD` (required when `enable_ubuntu_ssh` is true; minimum 16 characters)
 - A VPS/bastion account that permits remote TCP forwarding
 
 Backblaze B2:
@@ -99,6 +100,8 @@ VNC: <TAILSCALE_IP>:5900
 Cloudflare uses authenticated TCP hostnames and requires `cloudflared access tcp` on the client. SSH relay creates loopback-only reverse ports on your VPS; use an SSH local-forward command printed by the workflow to reach them. VNC remains active with every provider even when RDP works.
 
 Pinggy needs no VPS or client-side tunnel: the workflow prints temporary public TCP endpoints for RDP and VNC. Free endpoints can change or expire. Because these endpoints are public, use a strong Windows password and set the `VNC_PASSWORD` repository secret to at least 8 characters. QEMU's VNC authentication uses the first 8 characters.
+
+Set `enable_ubuntu_ssh` to `true` with Pinggy to create a temporary Ubuntu terminal endpoint. Connect with `ssh -p port vmadmin@host` and use the `UBUNTU_SSH_PASSWORD` secret. Root login is disabled, authentication attempts are limited, and TCP/agent/X11 forwarding are disabled. The `vmadmin` account may use `sudo` with the same password. The account and endpoint disappear with the hosted runner. Enabling this administrative terminal gives its user access to the runner and potentially the job's credentials, so enable it only while actively using it.
 
 QEMU binds both forwarded ports directly to the Tailscale IPv4 address or to loopback for Cloudflare/SSH relay, never every host interface. Workflow inputs are passed through environment variables instead of being interpolated into shell programs, and third-party Actions are pinned to immutable commit SHAs.
 

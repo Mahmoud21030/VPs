@@ -456,6 +456,26 @@ class CoreTests(unittest.TestCase):
                     'set -u expands ${name} before a same-line local assignment',
                 )
 
+    def test_opt_in_ubuntu_ssh_is_password_hardened(self):
+        setup=(ROOT/'scripts'/'network'/'setup').read_text(encoding='utf-8')
+        for required in (
+            'PermitRootLogin no',
+            'PermitEmptyPasswords no',
+            'AllowUsers vmadmin',
+            'MaxAuthTries 3',
+            'AllowTcpForwarding no',
+            'UBUNTU_SSH_PASSWORD must contain at least 16 characters',
+        ):
+            self.assertIn(required,setup)
+
+        for name in ('runtime.yml','base-image.yml'):
+            source=(ROOT/'.github'/'workflows'/name).read_text(encoding='utf-8')
+            workflow=yaml.load(source,Loader=yaml.BaseLoader)
+            inputs=workflow['on']['workflow_dispatch']['inputs']
+            self.assertIn('enable_ubuntu_ssh',inputs)
+            self.assertEqual(inputs['enable_ubuntu_ssh']['default'],'false')
+            self.assertNotIn('ssh vmadmin@${{',source)
+
 
 if __name__ == '__main__':
     unittest.main()

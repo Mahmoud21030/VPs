@@ -21,6 +21,11 @@ on:
           - cloudflare
           - ssh-relay
           - pinggy
+      enable_ubuntu_ssh:
+        description: Enable password-protected Ubuntu terminal (Pinggy only)
+        required: false
+        default: false
+        type: boolean
       cloudflare_rdp_hostname:
         description: Cloudflare Access TCP hostname routed to tcp://127.0.0.1:3389
         required: false
@@ -133,6 +138,8 @@ jobs:
       SSH_RELAY_PRIVATE_KEY: ${{ secrets.SSH_RELAY_PRIVATE_KEY }}
       SSH_RELAY_KNOWN_HOSTS: ${{ secrets.SSH_RELAY_KNOWN_HOSTS }}
       VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+      ENABLE_UBUNTU_SSH: ${{ inputs.enable_ubuntu_ssh }}
+      UBUNTU_SSH_PASSWORD: ${{ secrets.UBUNTU_SSH_PASSWORD }}
       AWS_REQUEST_CHECKSUM_CALCULATION: when_required
       AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
       AWS_EC2_METADATA_DISABLED: "true"
@@ -307,6 +314,12 @@ jobs:
               ;;
             pinggy)
               instructions="RDP: ${{ steps.network.outputs.rdp_endpoint }} | Emergency VNC: ${{ steps.network.outputs.vnc_endpoint }} (VNC uses the first 8 characters of the VNC_PASSWORD secret)"
+              if [[ "$ENABLE_UBUNTU_SSH" == "true" ]]; then
+                ubuntu_endpoint="${{ steps.network.outputs.ubuntu_ssh_endpoint }}"
+                ubuntu_host="${ubuntu_endpoint%:*}"
+                ubuntu_port="${ubuntu_endpoint##*:}"
+                instructions="${instructions} | Ubuntu SSH: ssh -p ${ubuntu_port} vmadmin@${ubuntu_host}"
+              fi
               ;;
             *) exit 2 ;;
           esac

@@ -28,6 +28,8 @@ Use a VPS or bastion that allows remote TCP forwarding. Add `SSH_RELAY_PRIVATE_K
 
 Select `pinggy` to create temporary public RDP and VNC endpoints without owning a relay VPS. Add a repository secret named `VNC_PASSWORD` containing at least 8 characters; QEMU VNC uses its first 8 characters. The workflow summary prints both endpoints as `host:port`, ready to enter in the RDP or VNC client. Free endpoints may change or expire, and they are publicly reachable, so use strong credentials.
 
+To open an Ubuntu terminal too, add `UBUNTU_SSH_PASSWORD` as a repository secret with at least 16 characters and select `enable_ubuntu_ssh: true`. Use the printed command `ssh -p port vmadmin@host`. This is a public, temporary endpoint protected by SSH encryption and the configured password; root login is disabled. The account has `sudo`, so anyone with this password can administer the runner and may access credentials used by the job.
+
 The workflow binds the remote reverse ports to `127.0.0.1` on the relay. On your client, authenticate to the same relay and create local forwards using the command printed in the workflow summary. This avoids publishing raw RDP or VNC ports on the internet.
 
 ## Backblaze B2

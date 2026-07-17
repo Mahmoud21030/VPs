@@ -21,6 +21,15 @@ stop_process "$WORK_DIR/cloudflared.pid" cloudflared "Cloudflare tunnel"
 stop_process "$WORK_DIR/ssh-relay.pid" "ssh -N -T" "SSH reverse relay"
 stop_process "$WORK_DIR/pinggy-rdp.pid" "ssh -p 443 -T" "Pinggy RDP tunnel"
 stop_process "$WORK_DIR/pinggy-vnc.pid" "ssh -p 443 -T" "Pinggy VNC tunnel"
+stop_process "$WORK_DIR/pinggy-ubuntu_ssh.pid" "ssh -p 443 -T" "Pinggy Ubuntu SSH tunnel"
+if [[ -f "$WORK_DIR/ubuntu-sshd/sshd.pid" ]]; then
+  sshd_pid="$(cat "$WORK_DIR/ubuntu-sshd/sshd.pid")"
+  if [[ "$sshd_pid" =~ ^[0-9]+$ ]] && sudo kill -0 "$sshd_pid" 2>/dev/null; then
+    log "stopping Ubuntu SSH server PID $sshd_pid"
+    sudo kill "$sshd_pid"
+  fi
+fi
 rm -rf "$WORK_DIR/ssh-relay"
 rm -rf "$WORK_DIR/pinggy"
+rm -rf "$WORK_DIR/ubuntu-sshd"
 log "network provider cleanup completed"
