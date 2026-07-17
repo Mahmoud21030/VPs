@@ -12,7 +12,7 @@ on:
           - backblaze
           - oracle
       network_provider:
-        description: Private connectivity or authenticated relay provider
+        description: Connectivity provider (Pinggy creates public TCP endpoints)
         required: true
         default: tailscale
         type: choice
@@ -20,6 +20,7 @@ on:
           - tailscale
           - cloudflare
           - ssh-relay
+          - pinggy
       cloudflare_rdp_hostname:
         description: Cloudflare Access TCP hostname routed to tcp://127.0.0.1:3389
         required: false
@@ -131,6 +132,7 @@ jobs:
       CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
       SSH_RELAY_PRIVATE_KEY: ${{ secrets.SSH_RELAY_PRIVATE_KEY }}
       SSH_RELAY_KNOWN_HOSTS: ${{ secrets.SSH_RELAY_KNOWN_HOSTS }}
+      VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
       AWS_REQUEST_CHECKSUM_CALCULATION: when_required
       AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
       AWS_EC2_METADATA_DISABLED: "true"
@@ -302,6 +304,9 @@ jobs:
               ;;
             ssh-relay)
               instructions="On your client run: ssh -p ${SSH_RELAY_PORT} -N -L 13389:127.0.0.1:${SSH_RELAY_RDP_PORT} -L 15900:127.0.0.1:${SSH_RELAY_VNC_PORT} ${SSH_RELAY_USER}@${SSH_RELAY_HOST}"
+              ;;
+            pinggy)
+              instructions="RDP: ${{ steps.network.outputs.rdp_endpoint }} | Emergency VNC: ${{ steps.network.outputs.vnc_endpoint }} (VNC uses the first 8 characters of the VNC_PASSWORD secret)"
               ;;
             *) exit 2 ;;
           esac

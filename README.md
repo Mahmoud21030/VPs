@@ -36,6 +36,7 @@ SSH reverse-relay alternative:
 
 - `SSH_RELAY_PRIVATE_KEY`
 - `SSH_RELAY_KNOWN_HOSTS`
+- `VNC_PASSWORD` (required for public Pinggy VNC; QEMU VNC uses its first 8 characters)
 - A VPS/bastion account that permits remote TCP forwarding
 
 Backblaze B2:
@@ -76,7 +77,7 @@ The copy workflow `.github/workflows/copy-base-to-oracle.yml` can stage the Back
 Run `.github/workflows/runtime.yml` and select:
 
 - `storage_provider`: `backblaze` or `oracle`
-- `network_provider`: `tailscale`, `cloudflare`, or `ssh-relay`
+- `network_provider`: `tailscale`, `cloudflare`, `ssh-relay`, or `pinggy`
 - `memory_mb`: default `15360`
 - `cpu_cores`: default `4`
 - `disk_size`: default `220G`; whole-GiB values strictly above `80G`
@@ -96,6 +97,8 @@ VNC: <TAILSCALE_IP>:5900
 ```
 
 Cloudflare uses authenticated TCP hostnames and requires `cloudflared access tcp` on the client. SSH relay creates loopback-only reverse ports on your VPS; use an SSH local-forward command printed by the workflow to reach them. VNC remains active with every provider even when RDP works.
+
+Pinggy needs no VPS or client-side tunnel: the workflow prints temporary public TCP endpoints for RDP and VNC. Free endpoints can change or expire. Because these endpoints are public, use a strong Windows password and set the `VNC_PASSWORD` repository secret to at least 8 characters. QEMU's VNC authentication uses the first 8 characters.
 
 QEMU binds both forwarded ports directly to the Tailscale IPv4 address or to loopback for Cloudflare/SSH relay, never every host interface. Workflow inputs are passed through environment variables instead of being interpolated into shell programs, and third-party Actions are pinned to immutable commit SHAs.
 

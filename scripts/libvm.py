@@ -53,11 +53,11 @@ def validate_vm_bind_address(value,provider=None):
         raise RuntimeError(
             f'VM bind address must be a Tailscale IPv4 address: {value}'
         )
-    if provider in {'cloudflare','ssh-relay'} and not address.is_loopback:
+    if provider in {'cloudflare','ssh-relay','pinggy'} and not address.is_loopback:
         raise RuntimeError(
             f'{provider} requires a loopback VM bind address: {value}'
         )
-    if provider not in {'tailscale','cloudflare','ssh-relay'}:
+    if provider not in {'tailscale','cloudflare','ssh-relay','pinggy'}:
         raise RuntimeError(f'unsupported NETWORK_PROVIDER: {provider!r}')
     return str(address)
 
@@ -517,11 +517,28 @@ def boot():
         '-qmp',f"unix:{sock},server=on,wait=off",
         '-pidfile',str(pid),
         '-daemonize',
-        '-vnc',f"{bind_address}:{v.get('vnc_display',0)}",
+        '-vnc',(
+            f"{bind_address}:{v.get('vnc_display',0)},password=on"
+            if os.environ.get('NETWORK_PROVIDER','tailscale') == 'pinggy'
+            else f"{bind_address}:{v.get('vnc_display',0)}"
+        ),
         '-serial','file:'+str(ROOT/v['monitor_log']),
     ]
 
     run(cmd)
+    if os.environ.get('NETWORK_PROVIDER','tailscale') == 'pinggy':
+        password=os.environ.get('VNC_PASSWORD','')[:8]
+        if len(password) < 8:
+            raise SystemExit('VNC_PASSWORD must contain at least 8 characters for Pinggy')
+        deadline=time.time()+30
+        while True:
+            try:
+                qmp_cmd('set_password',{'protocol':'vnc','password':password})
+                break
+            except (OSError,RuntimeError,TimeoutError,ConnectionError):
+                if time.time() >= deadline:
+                    raise RuntimeError('could not set the required Pinggy VNC password through QMP')
+                time.sleep(1)
     log(
         f"qemu started with virtual disk size {requested_disk_size}; "
         f"VirtIO driver ISO mounted as CD-ROM"

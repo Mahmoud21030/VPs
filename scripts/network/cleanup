@@ -19,5 +19,8 @@ stop_process() {
 
 stop_process "$WORK_DIR/cloudflared.pid" cloudflared "Cloudflare tunnel"
 stop_process "$WORK_DIR/ssh-relay.pid" "ssh -N -T" "SSH reverse relay"
+stop_process "$WORK_DIR/pinggy-rdp.pid" "ssh -p 443 -T" "Pinggy RDP tunnel"
+stop_process "$WORK_DIR/pinggy-vnc.pid" "ssh -p 443 -T" "Pinggy VNC tunnel"
 rm -rf "$WORK_DIR/ssh-relay"
+rm -rf "$WORK_DIR/pinggy"
 log "network provider cleanup completed"

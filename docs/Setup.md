@@ -24,6 +24,10 @@ Then connect RDP to `localhost:13389` or VNC to `localhost:15900`. Cloudflare Tu
 
 Use a VPS or bastion that allows remote TCP forwarding. Add `SSH_RELAY_PRIVATE_KEY` and a pinned `SSH_RELAY_KNOWN_HOSTS` entry as repository secrets. Select `ssh-relay`, then provide the relay host, user, SSH port, and remote RDP/VNC ports as workflow inputs.
 
+## Pinggy public TCP tunnels
+
+Select `pinggy` to create temporary public RDP and VNC endpoints without owning a relay VPS. Add a repository secret named `VNC_PASSWORD` containing at least 8 characters; QEMU VNC uses its first 8 characters. The workflow summary prints both endpoints as `host:port`, ready to enter in the RDP or VNC client. Free endpoints may change or expire, and they are publicly reachable, so use strong credentials.
+
 The workflow binds the remote reverse ports to `127.0.0.1` on the relay. On your client, authenticate to the same relay and create local forwards using the command printed in the workflow summary. This avoids publishing raw RDP or VNC ports on the internet.
 
 ## Backblaze B2

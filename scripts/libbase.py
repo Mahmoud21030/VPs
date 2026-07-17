@@ -210,9 +210,9 @@ def vm_bind_address() -> str:
         raise RuntimeError(f"VM bind address must be IPv4: {value}")
     if provider == "tailscale" and address not in ipaddress.ip_network("100.64.0.0/10"):
         raise RuntimeError(f"VM bind address must be a Tailscale IPv4 address: {value}")
-    if provider in {"cloudflare", "ssh-relay"} and not address.is_loopback:
+    if provider in {"cloudflare", "ssh-relay", "pinggy"} and not address.is_loopback:
         raise RuntimeError(f"{provider} requires a loopback VM bind address: {value}")
-    if provider not in {"tailscale", "cloudflare", "ssh-relay"}:
+    if provider not in {"tailscale", "cloudflare", "ssh-relay", "pinggy"}:
         raise RuntimeError(f"unsupported NETWORK_PROVIDER: {provider!r}")
     return str(address)
 
@@ -387,11 +387,31 @@ def build(args: argparse.Namespace) -> None:
         "-qmp", f"unix:{qmp_socket},server=on,wait=off",
         "-pidfile", pidfile,
         "-daemonize",
-        "-vnc", f"{bind_address}:0",
+        "-vnc", (
+            f"{bind_address}:0,password=on"
+            if os.environ.get("NETWORK_PROVIDER", "tailscale") == "pinggy"
+            else f"{bind_address}:0"
+        ),
         "-serial", f"file:{ROOT / vm['monitor_log']}",
     ]
 
     run(qemu_command)
+    if os.environ.get("NETWORK_PROVIDER", "tailscale") == "pinggy":
+        from libvm import QMP
+
+        password = os.environ.get("VNC_PASSWORD", "")[:8]
+        if len(password) < 8:
+            raise RuntimeError("VNC_PASSWORD must contain at least 8 characters for Pinggy")
+        deadline = time.time() + 30
+        while True:
+            try:
+                with QMP(qmp_socket, 10) as qmp:
+                    qmp.cmd("set_password", {"protocol": "vnc", "password": password})
+                break
+            except (OSError, RuntimeError, TimeoutError, ConnectionError):
+                if time.time() >= deadline:
+                    raise RuntimeError("could not set the required Pinggy VNC password through QMP")
+                time.sleep(1)
     log("base image installer VM started")
     log("VNC is listening on TCP port 5900; install Windows manually and shut it down normally when finished")
 

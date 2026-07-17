@@ -368,7 +368,7 @@ class CoreTests(unittest.TestCase):
         for address in ('0.0.0.0','127.0.0.1','192.168.1.10','not-an-ip'):
             with self.assertRaises(RuntimeError):
                 libvm.validate_vm_bind_address(address,'tailscale')
-        for provider in ('cloudflare','ssh-relay'):
+        for provider in ('cloudflare','ssh-relay','pinggy'):
             self.assertEqual(
                 libvm.validate_vm_bind_address('127.0.0.1',provider),
                 '127.0.0.1',
@@ -432,7 +432,7 @@ class CoreTests(unittest.TestCase):
         )
         self.assertEqual(dependabot.get('version'),'2')
 
-    def test_vm_workflows_offer_three_network_providers(self):
+    def test_vm_workflows_offer_network_providers(self):
         for name in ('runtime.yml','base-image.yml'):
             workflow=yaml.load(
                 (ROOT/'.github'/'workflows'/name).read_text(encoding='utf-8'),
@@ -441,7 +441,7 @@ class CoreTests(unittest.TestCase):
             options=workflow['on']['workflow_dispatch']['inputs'][
                 'network_provider'
             ]['options']
-            self.assertEqual(options,['tailscale','cloudflare','ssh-relay'])
+            self.assertEqual(options,['tailscale','cloudflare','ssh-relay','pinggy'])
 
         source=(ROOT/'scripts/libvm.py').read_text(encoding='utf-8')
         self.assertNotIn('hostfwd=tcp:0.0.0.0',source)

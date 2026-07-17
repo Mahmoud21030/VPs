@@ -13,6 +13,11 @@ write_address() {
   log "network provider ready: provider=$provider bind_address=$address"
 }
 
+write_endpoint() {
+  local name="$1" endpoint="$2"
+  printf '%s_endpoint=%s\n' "$name" "$endpoint" >> "$output_file"
+}
+
 validate_port() {
   local name="$1" value="$2"
   if [[ ! "$value" =~ ^[0-9]+$ ]] || (( value < 1024 || value > 65535 )); then
@@ -128,6 +133,58 @@ case "$provider" in
       cat "$LOG_DIR/ssh-relay.log" >&2
       wait "$relay_pid"
     fi
+    write_address 127.0.0.1
+    ;;
+
+  pinggy)
+    require ssh
+    : "${VNC_PASSWORD:?VNC_PASSWORD secret is required when network_provider is pinggy}"
+    if (( ${#VNC_PASSWORD} < 8 )); then
+      echo "VNC_PASSWORD must contain at least 8 characters" >&2
+      exit 2
+    fi
+
+    pinggy_dir="$WORK_DIR/pinggy"
+    install -d -m 0700 "$pinggy_dir"
+
+    start_pinggy_tunnel() {
+      local name="$1" local_port="$2" log_file="$LOG_DIR/pinggy-${name}.log"
+      local pid_file="$WORK_DIR/pinggy-${name}.pid" pid endpoint=""
+      ssh -p 443 -T \
+        -o BatchMode=yes \
+        -o ConnectTimeout=30 \
+        -o ExitOnForwardFailure=yes \
+        -o ServerAliveInterval=30 \
+        -o ServerAliveCountMax=3 \
+        -o StrictHostKeyChecking=accept-new \
+        -o UserKnownHostsFile="$pinggy_dir/known_hosts" \
+        -R "0:127.0.0.1:${local_port}" \
+        tcp@free.pinggy.io > "$log_file" 2>&1 &
+      pid=$!
+      printf '%s\n' "$pid" > "$pid_file"
+
+      for _ in $(seq 1 60); do
+        endpoint="$(grep -Eom1 'tcp://[A-Za-z0-9.-]+:[0-9]+' "$log_file" 2>/dev/null || :)"
+        if [[ -n "$endpoint" ]]; then
+          endpoint="${endpoint#tcp://}"
+          log "Pinggy $name endpoint ready: $endpoint"
+          write_endpoint "$name" "$endpoint"
+          return 0
+        fi
+        if ! kill -0 "$pid" 2>/dev/null; then
+          echo "Pinggy $name tunnel exited before publishing an endpoint" >&2
+          cat "$log_file" >&2
+          wait "$pid"
+        fi
+        sleep 1
+      done
+      echo "Pinggy $name tunnel did not publish an endpoint within 60 seconds" >&2
+      tail -n 100 "$log_file" >&2
+      return 1
+    }
+
+    start_pinggy_tunnel rdp 3389
+    start_pinggy_tunnel vnc 5900
     write_address 127.0.0.1
     ;;
 
