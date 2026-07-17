@@ -28,8 +28,15 @@ while true; do
   fi
 
   loop_pid="$(cat "$WORK_DIR/checkpoint-loop.pid" 2>/dev/null || true)"
-  if ! pid_matches_command "$loop_pid" "$ROOT_DIR/scripts/checkpoint/loop"; then
+  if ! pid_matches_command "$loop_pid" "scripts/checkpoint/loop"; then
     echo "automatic checkpoint loop exited unexpectedly" >&2
+    if [[ "$loop_pid" =~ ^[0-9]+$ && -r "/proc/$loop_pid/cmdline" ]]; then
+      printf 'checkpoint loop PID %s command: ' "$loop_pid" >&2
+      tr '\0' ' ' < "/proc/$loop_pid/cmdline" >&2
+      printf '\n' >&2
+    else
+      echo "checkpoint loop PID file was missing, invalid, or stale: ${loop_pid:-<empty>}" >&2
+    fi
     exit 1
   fi
 

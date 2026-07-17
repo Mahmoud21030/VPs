@@ -476,6 +476,15 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(inputs['enable_ubuntu_ssh']['default'],'false')
             self.assertNotIn('ssh vmadmin@${{',source)
 
+    def test_checkpoint_supervisor_accepts_absolute_or_relative_loop_path(self):
+        supervisor=(ROOT/'scripts'/'runtime'/'supervise').read_text(encoding='utf-8')
+        workflow=(ROOT/'.github'/'workflows'/'runtime.yml').read_text(encoding='utf-8')
+        self.assertIn(
+            'pid_matches_command "$loop_pid" "scripts/checkpoint/loop"',
+            supervisor,
+        )
+        self.assertIn('"$PWD/scripts/checkpoint/loop"',workflow)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -417,7 +417,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           rm -f work/checkpoint-loop.stop work/final-checkpoint.done
-          scripts/checkpoint/loop \
+          "$PWD/scripts/checkpoint/loop" \
             > >(tee -a logs/checkpoint-loop.log) 2>&1 &
           LOOP_PID=$!
           for attempt in $(seq 1 50); do
