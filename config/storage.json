@@ -6,7 +6,6 @@
   "latest_sha256_object": "latest/overlay.sha256",
   "manifest_object": "latest/manifest.json",
   "checkpoint_prefix": "checkpoints",
-  "rotation_count": 0,
   "providers": {
     "backblaze": {
       "bucket_env": "B2_BUCKET",

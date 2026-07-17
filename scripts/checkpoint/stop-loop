@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+source "$(dirname "$0")/../common.sh"
+
+stop_file="$WORK_DIR/checkpoint-loop.stop"
+pid_file="$WORK_DIR/checkpoint-loop.pid"
+touch "$stop_file"
+
+if [[ ! -f "$pid_file" ]]; then
+  log "checkpoint loop is not running"
+  exit 0
+fi
+
+loop_pid="$(cat "$pid_file")"
+if [[ ! "$loop_pid" =~ ^[0-9]+$ ]]; then
+  echo "invalid checkpoint loop PID: $loop_pid" >&2
+  exit 1
+fi
+
+log "waiting for checkpoint loop PID $loop_pid to stop cleanly"
+while [[ -f "$pid_file" ]] && kill -0 "$loop_pid" 2>/dev/null; do
+  sleep 2
+done
+rm -f "$pid_file"
+log "checkpoint loop stopped cleanly"

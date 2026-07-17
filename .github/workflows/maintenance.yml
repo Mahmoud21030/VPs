@@ -1,4 +1,5 @@
 name: maintenance
+
 on:
   workflow_dispatch:
     inputs:
@@ -12,14 +13,18 @@ on:
           - oracle
   schedule:
     - cron: '17 3 * * 0'
+
 concurrency:
   group: windows-vm-maintenance
   cancel-in-progress: false
+
 jobs:
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 180
     env:
       STORAGE_PROVIDER: ${{ inputs.storage_provider || vars.STORAGE_PROVIDER || 'backblaze' }}
+      ALLOW_FRESH_OVERLAY_IF_MISSING: "false"
       B2_BUCKET: ${{ secrets.B2_BUCKET }}
       B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
       B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
@@ -31,10 +36,32 @@ jobs:
       ORACLE_ENDPOINT: ${{ secrets.ORACLE_ENDPOINT }}
       ORACLE_ACCESS_KEY_ID: ${{ secrets.ORACLE_ACCESS_KEY_ID }}
       ORACLE_SECRET_ACCESS_KEY: ${{ secrets.ORACLE_SECRET_ACCESS_KEY }}
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      AWS_EC2_METADATA_DISABLED: "true"
+
     steps:
+      - name: Show runner operating system CPU RAM swap and storage
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          uname -a
+          cat /etc/os-release
+          lscpu
+          echo "Logical CPU count: $(nproc)"
+          free -h
+          grep -E 'MemTotal|MemAvailable|SwapTotal|SwapFree' /proc/meminfo
+          lsblk -o NAME,TYPE,SIZE,FSTYPE,FSAVAIL,MOUNTPOINTS
+          df -hT
+          df -B1 -P
+
       - uses: actions/checkout@v4
+      - run: scripts/bootstrap/prepare-work-drive.sh
       - run: scripts/bootstrap/install.sh
       - run: scripts/storage/login
-      - run: scripts/restore/restore
-      - run: qemu-img check work/overlay.qcow2
-      - run: scripts/verify/sha256 work/overlay.qcow2.zst work/overlay.sha256
+      - name: Strictly restore and verify latest persistent state
+        run: |
+          set -Eeuo pipefail
+          scripts/restore/restore
+          qemu-img check work/base.qcow2
+          qemu-img check work/overlay.qcow2

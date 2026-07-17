@@ -1,30 +1,11 @@
-Oracle checkpoint rotation GetObjectTagging fix
+Oracle S3-to-S3 copy compatibility note
 
-Failure fixed:
-  NotImplemented when calling GetObjectTagging
-  S3 Get Object tagging operation is not supported
+AWS CLI v2 can call HeadObject, GetObjectTagging, and PutObjectTagging while
+copying S3 objects. Oracle-compatible endpoints may not implement the tagging
+operations. Every S3-to-S3 copy in this project therefore adds:
 
-Cause:
-  AWS CLI v2 performs extra tag/metadata API calls during S3-to-S3
-  multipart copies by default.
+  --copy-props none
 
-Fix:
-  For remote-to-remote checkpoint rotation copies, the command now adds:
-    --copy-props none
-
-This keeps the object bytes but avoids GetObjectTagging/PutObjectTagging
-calls that OCI's S3-compatible endpoint rejects.
-
-Previous fixes retained in this libvm.py:
-  - Windows normal-shutdown offline checkpoint save
-  - checkpoint locking
-  - Oracle checksum/chunked-upload compatibility settings
-  - 220G/resizable VM disk support
-  - VirtIO CD support
-
-Expected rotation log:
-  remote object copy without tags/metadata: s3://...latest/... -> s3://...checkpoint1/...
-
-Expected final success log:
-  checkpoint uploaded and verified: latest (offline-stopped)
-  final latest checkpoint completed successfully
+Checkpoint rotation itself is disabled. The persistent layout retains only
+base.qcow2 and latest/{overlay.qcow2.zst,overlay.sha256,manifest.json}; obsolete
+objects are deleted only below windows-vm/checkpoints/.

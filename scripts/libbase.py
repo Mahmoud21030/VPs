@@ -168,7 +168,7 @@ def s3_uri(object_name: str) -> str:
 
 def aws_cp(source: str, destination: str) -> subprocess.CompletedProcess[str]:
     return run(
-        ["aws", "--endpoint-url", endpoint(), "s3", "cp", source, destination, "--only-show-errors"],
+        ["aws", "--endpoint-url", endpoint(), "s3", "cp", source, destination],
         env=aws_env(),
     )
 
@@ -297,7 +297,7 @@ def build(args: argparse.Namespace) -> None:
         "-cpu", "host",
         "-drive", f"if=pflash,format=raw,readonly=on,file={vm['uefi_code']}",
         "-drive", f"if=pflash,format=raw,file={uefi_vars_destination}",
-        "-drive", f"file={base},if=virtio,format=qcow2,cache=writeback,discard=unmap",
+        "-drive", f"file={base},if=virtio,format=qcow2,cache=writeback,discard=unmap,id={vm['disk_id']}",
         "-cdrom", windows_iso,
         "-drive", f"if=none,id=virtiocd,file={virtio_iso},format=raw,media=cdrom,readonly=on",
         "-device", "ide-cd,drive=virtiocd",
@@ -317,7 +317,7 @@ def build(args: argparse.Namespace) -> None:
 
     wait_for_poweroff(pidfile, args.install_timeout_minutes * 60)
 
-    run(["qemu-img", "check", "-r", "leaks", base], check=False)
+    run(["qemu-img", "check", base])
 
     compacted = base.with_suffix(".compact.qcow2")
     compacted.unlink(missing_ok=True)
@@ -373,21 +373,17 @@ def upload(_: argparse.Namespace) -> None:
             encoding="utf-8",
         )
 
-    objects = [
-        (storage["base_object"], base),
-        ("base.sha256", checksum_file),
-        ("base-manifest.json", manifest),
-    ]
-
-    for object_name, path in objects:
-        retry(
-            checkpoint["upload_retries"],
-            checkpoint["retry_initial_seconds"],
-            checkpoint["retry_max_seconds"],
-            aws_cp,
-            str(path),
-            s3_uri(object_name),
-        )
+    # Object storage intentionally retains only one immutable base object.
+    # The local checksum and manifest are workflow artifacts, while the remote
+    # base is verified by downloading its bytes again after upload.
+    retry(
+        checkpoint["upload_retries"],
+        checkpoint["retry_initial_seconds"],
+        checkpoint["retry_max_seconds"],
+        aws_cp,
+        str(base),
+        s3_uri(storage["base_object"]),
+    )
 
     verification_copy = WORK / "base.verify.qcow2"
     verification_copy.unlink(missing_ok=True)
@@ -417,7 +413,7 @@ def main() -> None:
     build_parser.add_argument("--virtio-iso-url", required=True)
     build_parser.add_argument("--windows-iso-sha256", default="")
     build_parser.add_argument("--virtio-iso-sha256", default="")
-    build_parser.add_argument("--disk-size", default="80G")
+    build_parser.add_argument("--disk-size", default="220G")
     build_parser.add_argument("--memory-mb", type=int, default=8192)
     build_parser.add_argument("--cpu-cores", type=int, default=4)
     build_parser.add_argument("--install-timeout-minutes", type=int, default=180)

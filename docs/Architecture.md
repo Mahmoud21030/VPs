@@ -1,7 +1,9 @@
 # Architecture
 
-The system runs a Windows guest on QEMU inside an Ubuntu GitHub Actions runner. The immutable disk is `base.qcow2`. Persistent state is stored only in `overlay.qcow2`, a QCOW2 backing overlay referencing the base image.
+The Windows guest runs under QEMU/KVM on `ubuntu-latest` with Q35 and OVMF UEFI. QEMU attaches a read-only VirtIO driver ISO, a VirtIO network adapter, and a sparse writable QCOW2 overlay backed by the immutable `base.qcow2`. The base object is downloaded for each ephemeral runner but is never opened as the writable guest disk.
 
-The overlay preserves installed applications, Windows configuration, files, registry changes, and user profile state. Checkpoints compress the overlay with zstd, generate SHA256 metadata, upload it to Backblaze B2 through the S3 API, and verify the uploaded object by downloading it and checking the digest.
+QEMU user networking forwards TCP 3389 for RDP. The QEMU VNC server listens on TCP 5900 as an independent emergency console. Both are reached through the runner's ephemeral Tailscale `tag:ci` address.
 
-QMP controls shutdown, pause, resume, and filesystem-freeze operations. QEMU is not killed directly during normal operation.
+Online persistence uses QMP `drive-backup` with the configured disk ID and `sync=full`. QMP job status is monitored until the job concludes, errors and timeouts fail the checkpoint, and the concluded job is dismissed. `qemu-img` touches only the released backup target. The full point-in-time image is converted to a sparse QCOW2 overlay backed by the immutable base before compression.
+
+Offline persistence begins only after QEMU has stopped. It checks the inactive overlay, compacts it when temporary capacity is sufficient, compresses to an atomic temporary file, uploads the archive and metadata, downloads the archive again, and reports success only after the downloaded SHA256 matches.

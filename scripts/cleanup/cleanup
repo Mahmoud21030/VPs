@@ -4,17 +4,17 @@ source "$(dirname "$0")/../common.sh"
 
 log "cleanup started"
 
-# Stop the background checkpoint loop so it cannot race with the final save.
-if [[ -f "$WORK_DIR/checkpoint-loop.pid" ]]; then
-    CHECKPOINT_LOOP_PID="$(cat "$WORK_DIR/checkpoint-loop.pid" 2>/dev/null || true)"
+"$ROOT_DIR/scripts/checkpoint/stop-loop"
 
-    if [[ -n "$CHECKPOINT_LOOP_PID" ]]; then
-        log "stopping checkpoint loop PID $CHECKPOINT_LOOP_PID"
-        kill "$CHECKPOINT_LOOP_PID" 2>/dev/null || true
-        wait "$CHECKPOINT_LOOP_PID" 2>/dev/null || true
+if [[ -f "$WORK_DIR/final-checkpoint.done" ]]; then
+    log "verified final latest checkpoint was already completed"
+    if [[ -f "$WORK_DIR/qemu.pid" ]]; then
+        QEMU_PID="$(cat "$WORK_DIR/qemu.pid")"
+        if kill -0 "$QEMU_PID" 2>/dev/null; then
+            "$ROOT_DIR/scripts/qemu/shutdown"
+        fi
     fi
-
-    rm -f "$WORK_DIR/checkpoint-loop.pid"
+    exit 0
 fi
 
 OVERLAY_PATH="$ROOT_DIR/$(jq -r '.overlay_image' "$ROOT_DIR/config/vm.json")"
@@ -26,4 +26,12 @@ fi
 
 log "starting final latest checkpoint"
 python3 "$ROOT_DIR/scripts/libvm.py" checkpoint --name latest
+touch "$WORK_DIR/final-checkpoint.done"
 log "final latest checkpoint completed successfully"
+
+if [[ -f "$WORK_DIR/qemu.pid" ]]; then
+    QEMU_PID="$(cat "$WORK_DIR/qemu.pid")"
+    if kill -0 "$QEMU_PID" 2>/dev/null; then
+        "$ROOT_DIR/scripts/qemu/shutdown"
+    fi
+fi

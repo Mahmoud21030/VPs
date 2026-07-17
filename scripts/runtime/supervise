@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+source "$(dirname "$0")/../common.sh"
+
+forced_minutes="$(jq -r '.forced_save_after_minutes // 300' "$ROOT_DIR/config/checkpoint.json")"
+if [[ ! "$forced_minutes" =~ ^[0-9]+$ ]] || (( forced_minutes < 1 )); then
+  echo "invalid forced_save_after_minutes: $forced_minutes" >&2
+  exit 1
+fi
+
+start_epoch="${WORKFLOW_START_EPOCH:-$(date +%s)}"
+if [[ ! "$start_epoch" =~ ^[0-9]+$ ]]; then
+  echo "invalid WORKFLOW_START_EPOCH: $start_epoch" >&2
+  exit 1
+fi
+
+deadline=$((start_epoch + forced_minutes * 60))
+log "runtime supervisor started; forced final save deadline=$(date -u -d "@$deadline" +%Y-%m-%dT%H:%M:%SZ)"
+
+while true; do
+  qemu_pid="$(cat "$WORK_DIR/qemu.pid" 2>/dev/null || true)"
+  if [[ -z "$qemu_pid" ]] || ! kill -0 "$qemu_pid" 2>/dev/null; then
+    log "QEMU exited after normal Windows shutdown"
+    "$ROOT_DIR/scripts/checkpoint/stop-loop"
+    "$ROOT_DIR/scripts/checkpoint/checkpoint" latest
+    touch "$WORK_DIR/final-checkpoint.done"
+    log "final latest checkpoint completed successfully"
+    exit 0
+  fi
+
+  if [[ ! -f "$WORK_DIR/checkpoint-loop.pid" ]]; then
+    echo "automatic checkpoint loop exited unexpectedly" >&2
+    exit 1
+  fi
+
+  now="$(date +%s)"
+  if (( now >= deadline )); then
+    log "forced-save deadline reached after ${forced_minutes} minute(s)"
+    "$ROOT_DIR/scripts/checkpoint/stop-loop"
+    "$ROOT_DIR/scripts/checkpoint/checkpoint" latest
+    touch "$WORK_DIR/final-checkpoint.done"
+    log "forced final latest checkpoint completed successfully"
+    "$ROOT_DIR/scripts/qemu/shutdown"
+    log "QEMU shut down after verified forced final checkpoint"
+    exit 0
+  fi
+
+  sleep 10
+done

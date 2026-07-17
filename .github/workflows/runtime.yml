@@ -21,25 +21,36 @@ on:
         required: false
         default: "4"
         type: string
-
       disk_size:
-        description: Virtual Windows disk size, must be above 80G (example 220G)
+        description: Sparse virtual disk size (whole GiB, strictly above 80G)
         required: false
         default: 220G
         type: string
-
       checkpoint_interval_minutes:
-        description: Automatic checkpoint interval in minutes
+        description: Positive integer interval between completed checkpoints
         required: false
-        default: "30"
+        default: "15"
         type: string
-
+      compression_level:
+        description: zstd level 1-22 (10 recommended; levels above 19 use --ultra)
+        required: false
+        default: "10"
+        type: string
+      forced_save_after_minutes:
+        description: Force a verified final save this many minutes after job start
+        required: false
+        default: "300"
+        type: string
+      allow_fresh_overlay_if_missing:
+        description: Explicitly allow a blank overlay when latest cannot be restored
+        required: false
+        default: false
+        type: boolean
       virtio_iso_url:
         description: Direct HTTPS URL to the VirtIO Windows driver ISO
         required: false
         default: https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso
         type: string
-
       virtio_iso_sha256:
         description: Optional SHA256 checksum for the VirtIO ISO
         required: false
@@ -57,6 +68,7 @@ jobs:
 
     env:
       STORAGE_PROVIDER: ${{ inputs.storage_provider || vars.STORAGE_PROVIDER || 'backblaze' }}
+      ALLOW_FRESH_OVERLAY_IF_MISSING: ${{ inputs.allow_fresh_overlay_if_missing }}
       B2_BUCKET: ${{ secrets.B2_BUCKET }}
       B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
       B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
@@ -68,73 +80,52 @@ jobs:
       ORACLE_ENDPOINT: ${{ secrets.ORACLE_ENDPOINT }}
       ORACLE_ACCESS_KEY_ID: ${{ secrets.ORACLE_ACCESS_KEY_ID }}
       ORACLE_SECRET_ACCESS_KEY: ${{ secrets.ORACLE_SECRET_ACCESS_KEY }}
-
-      # AWS CLI v2 compatibility for OCI/S3-compatible multipart uploads.
       AWS_REQUEST_CHECKSUM_CALCULATION: when_required
       AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
       AWS_EC2_METADATA_DISABLED: "true"
 
     steps:
-      - name: Show runner CPU RAM and disk specifications
+      - name: Show runner operating system CPU RAM swap and storage
         shell: bash
         run: |
           set -Eeuo pipefail
+          echo "WORKFLOW_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
 
           echo "============================================================"
           echo "RUNNER SPECIFICATIONS"
           echo "============================================================"
-
-          echo
           echo "=== OPERATING SYSTEM ==="
           uname -a
-          cat /etc/os-release || true
-
-          echo
-          echo "=== CPU ==="
-          echo "Logical CPUs: $(nproc)"
+          cat /etc/os-release
+          echo "=== CPU MODEL AND LOGICAL CPU COUNT ==="
           lscpu
-
-          echo
-          echo "=== RAM ==="
+          echo "Logical CPU count: $(nproc)"
+          echo "=== RAM AND SWAP ==="
           free -h
-          grep -E 'MemTotal|MemAvailable|SwapTotal|SwapFree' /proc/meminfo || true
-
-          echo
-          echo "=== BLOCK DEVICES ==="
-          lsblk -o NAME,TYPE,SIZE,FSTYPE,FSAVAIL,MOUNTPOINTS || true
-
-          echo
-          echo "=== FILESYSTEM SPACE ==="
+          grep -E 'MemTotal|MemAvailable|SwapTotal|SwapFree' /proc/meminfo
+          echo "=== BLOCK DEVICES FILESYSTEMS AND MOUNT POINTS ==="
+          lsblk -o NAME,TYPE,SIZE,FSTYPE,FSAVAIL,MOUNTPOINTS
+          echo "=== FILESYSTEM TYPES AND AVAILABLE SPACE ==="
           df -hT
-
-          echo
-          echo "=== RAW FILESYSTEM SPACE IN BYTES ==="
+          echo "=== RAW AVAILABLE BYTES ==="
           df -B1 -P
-
-          {
-            echo "### Runner specifications"
-            echo
-            echo "- Logical CPUs: \`$(nproc)\`"
-            echo "- RAM: \`$(free -h | awk '/^Mem:/ {print $2}')\`"
-            echo
-            echo '```text'
-            df -hT
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Use largest writable filesystem for VM files
+      - name: Use largest writable filesystem for physical VM files
         shell: bash
         run: scripts/bootstrap/prepare-work-drive.sh
 
-      - name: Configure runtime resources and virtual disk size
+      - name: Validate and configure runtime inputs
         shell: bash
         env:
           MEMORY_MB: ${{ inputs.memory_mb }}
           CPU_CORES: ${{ inputs.cpu_cores }}
           DISK_SIZE: ${{ inputs.disk_size }}
+          CHECKPOINT_INTERVAL_MINUTES: ${{ inputs.checkpoint_interval_minutes }}
+          COMPRESSION_LEVEL: ${{ inputs.compression_level }}
+          FORCED_SAVE_AFTER_MINUTES: ${{ inputs.forced_save_after_minutes }}
         run: |
           set -Eeuo pipefail
 
@@ -142,67 +133,80 @@ jobs:
             echo "::error::memory_mb must be an integer of at least 1024"
             exit 1
           fi
-
           if [[ ! "$CPU_CORES" =~ ^[0-9]+$ ]] || (( CPU_CORES < 1 )); then
             echo "::error::cpu_cores must be a positive integer"
             exit 1
           fi
-
           if [[ ! "$DISK_SIZE" =~ ^[0-9]+G$ ]]; then
             echo "::error::disk_size must use whole GiB syntax such as 220G"
             exit 1
           fi
-
           disk_gib="${DISK_SIZE%G}"
-
           if (( disk_gib <= 80 )); then
-            echo "::error::disk_size must be above 80G"
+            echo "::error::disk_size must be strictly above 80G"
+            exit 1
+          fi
+          if [[ ! "$CHECKPOINT_INTERVAL_MINUTES" =~ ^[0-9]+$ ]] || (( CHECKPOINT_INTERVAL_MINUTES < 1 )); then
+            echo "::error::checkpoint_interval_minutes must be a positive integer"
+            exit 1
+          fi
+          if [[ ! "$COMPRESSION_LEVEL" =~ ^[0-9]+$ ]] || (( COMPRESSION_LEVEL < 1 || COMPRESSION_LEVEL > 22 )); then
+            echo "::error::compression_level must be an integer from 1 through 22"
+            exit 1
+          fi
+          if [[ ! "$FORCED_SAVE_AFTER_MINUTES" =~ ^[0-9]+$ ]] || (( FORCED_SAVE_AFTER_MINUTES < 1 )); then
+            echo "::error::forced_save_after_minutes must be a positive integer"
+            exit 1
+          fi
+          if (( FORCED_SAVE_AFTER_MINUTES > 330 )); then
+            echo "::error::forced_save_after_minutes must be 330 or less so the save starts before the 360-minute hosted-job limit"
             exit 1
           fi
 
           jq \
+            --arg memory_mb "$MEMORY_MB" \
+            --arg cpu_cores "$CPU_CORES" \
             --arg disk_size "$DISK_SIZE" \
-            '.memory_mb=($ENV.MEMORY_MB|tonumber)
-             | .cpu_cores=($ENV.CPU_CORES|tonumber)
-             | .disk_size=$disk_size' \
+            '.memory_mb=($memory_mb|tonumber) | .cpu_cores=($cpu_cores|tonumber) | .disk_size=$disk_size' \
             config/vm.json > config/vm.json.tmp
-
           mv config/vm.json.tmp config/vm.json
 
-          echo "Configured VM:"
-          jq '{memory_mb, cpu_cores, disk_size}' config/vm.json
+          jq \
+            --arg interval "$CHECKPOINT_INTERVAL_MINUTES" \
+            --arg level "$COMPRESSION_LEVEL" \
+            --arg forced "$FORCED_SAVE_AFTER_MINUTES" \
+            '.interval_minutes=($interval|tonumber) | .compression_level=($level|tonumber) | .forced_save_after_minutes=($forced|tonumber)' \
+            config/checkpoint.json > config/checkpoint.json.tmp
+          mv config/checkpoint.json.tmp config/checkpoint.json
 
-      - name: Install dependencies
+          echo "Configured VM and persistence policy:"
+          jq '{memory_mb,cpu_cores,disk_size}' config/vm.json
+          jq '{interval_minutes,compression_level,forced_save_after_minutes}' config/checkpoint.json
+          echo "Fresh overlay authorization: $ALLOW_FRESH_OVERLAY_IF_MISSING"
+          echo "Higher zstd levels can create smaller files but require more CPU, RAM, and time."
+          echo "Levels 20-22 enable --ultra. Levels 19 or 22 may not finish before workflow termination."
+          echo "Level 10 is the safer storage-versus-time balance; compression must finish before upload begins."
+
+      - name: Install host dependencies
         run: scripts/bootstrap/install.sh
 
       - name: Enable KVM access
         shell: bash
         run: |
           set -Eeuo pipefail
-
           if [[ ! -e /dev/kvm ]]; then
-            echo "::error::/dev/kvm is not available on this runner"
+            echo "::error::/dev/kvm is not available on this ubuntu-latest runner"
             exit 1
           fi
-
           sudo chmod 666 /dev/kvm
-
-          if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
-            echo "::error::Current runner user cannot access /dev/kvm"
-            exit 1
-          fi
-
+          test -r /dev/kvm -a -w /dev/kvm
           ls -l /dev/kvm
-          echo "KVM access enabled successfully"
 
       - name: Authenticate selected object storage
         run: scripts/storage/login
 
-      - name: Remove old rotated checkpoints and reclaim storage
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          python3 scripts/libvm.py prune-old-checkpoints
+      - name: Delete only obsolete checkpoint objects
+        run: python3 scripts/libvm.py prune-old-checkpoints
 
       - name: Connect runner to Tailscale
         uses: tailscale/github-action@v4
@@ -211,62 +215,40 @@ jobs:
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
 
-      - name: Get Tailscale connection information
+      - name: Show private RDP and emergency VNC addresses
         id: tailscale
         shell: bash
         run: |
           set -Eeuo pipefail
-
           TS_IP="$(tailscale ip -4 | head -n 1)"
-
           if [[ -z "$TS_IP" ]]; then
             echo "::error::Could not determine the Tailscale IPv4 address"
             exit 1
           fi
-
           echo "ip=$TS_IP" >> "$GITHUB_OUTPUT"
-
+          echo "RDP: ${TS_IP}:3389"
+          echo "Emergency VNC: ${TS_IP}:5900"
+          tailscale status
           {
             echo "### Windows VM connection"
             echo
-            echo "- **RDP:** \`${TS_IP}:3389\`"
-            echo "- **Emergency VNC console:** \`${TS_IP}:5900\`"
-            echo "- VNC authentication: none"
+            echo "- RDP: \`${TS_IP}:3389\`"
+            echo "- Emergency VNC: \`${TS_IP}:5900\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "============================================================"
-          echo "Storage provider: $STORAGE_PROVIDER"
-          echo "WINDOWS VM CONNECTION INFORMATION"
-          echo
-          echo "RDP: ${TS_IP}:3389"
-          echo "VNC: ${TS_IP}:5900"
-          echo
-          echo "Use RDP for normal work."
-          echo "Use VNC for boot, recovery, driver, or RDP problems."
-          echo "============================================================"
-
-          tailscale status
-
-      - name: Restore persistent VM
+      - name: Restore persistent base and latest overlay
         run: scripts/restore/restore
 
-      - name: Download VirtIO driver ISO
+      - name: Download and verify VirtIO Windows driver ISO
         shell: bash
         env:
           VIRTIO_ISO_URL: ${{ inputs.virtio_iso_url }}
           VIRTIO_ISO_SHA256: ${{ inputs.virtio_iso_sha256 }}
         run: |
           set -Eeuo pipefail
-
-          mkdir -p work
-
           final_path="work/virtio-win.iso"
           temp_path="${final_path}.part"
-
           rm -f "$temp_path"
-
-          echo "Downloading VirtIO Windows driver ISO..."
-
           curl \
             --fail \
             --location \
@@ -276,176 +258,88 @@ jobs:
             --progress-bar \
             "$VIRTIO_ISO_URL" \
             --output "$temp_path"
-
-          if [[ -n "${VIRTIO_ISO_SHA256:-}" ]]; then
+          if [[ -n "$VIRTIO_ISO_SHA256" ]]; then
             expected="$(printf '%s' "$VIRTIO_ISO_SHA256" | tr '[:upper:]' '[:lower:]')"
-
             if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
-              echo "::error::virtio_iso_sha256 must contain exactly 64 hexadecimal characters"
+              echo "::error::virtio_iso_sha256 must be exactly 64 hexadecimal characters"
               exit 1
             fi
-
             actual="$(sha256sum "$temp_path" | awk '{print $1}')"
-
-            echo "Expected SHA256: $expected"
-            echo "Actual SHA256:   $actual"
-
             if [[ "$actual" != "$expected" ]]; then
-              echo "::error::VirtIO ISO SHA256 verification failed"
+              echo "::error::VirtIO ISO checksum mismatch: expected=$expected actual=$actual"
               exit 1
             fi
           fi
-
           mv "$temp_path" "$final_path"
-
-          echo "VirtIO ISO ready:"
           ls -lh "$final_path"
+          echo 'The ISO is mounted read-only. In Windows, use pnputil /add-driver "D:\*.inf" /subdirs /install (the CD drive letter may differ); NetKVM is the key network driver.'
 
-      - name: Boot Windows VM
+      - name: Boot Windows with QEMU KVM Q35 OVMF and VirtIO
         run: scripts/qemu/boot
 
-      - name: Wait for VNC console
+      - name: Wait for emergency VNC console
         shell: bash
         run: |
           set -Eeuo pipefail
-
-          echo "Waiting for QEMU VNC console on local port 5900..."
-
           for attempt in $(seq 1 90); do
             if nc -z 127.0.0.1 5900 2>/dev/null; then
-              echo "============================================================"
-              echo "VNC CONSOLE READY"
-              echo "Connect to: ${{ steps.tailscale.outputs.ip }}:5900"
-              echo "============================================================"
-              ss -ltnp | grep ':5900' || true
+              echo "Emergency VNC ready: ${{ steps.tailscale.outputs.ip }}:5900"
               exit 0
             fi
-
             if [[ -f work/qemu.pid ]]; then
               QEMU_PID="$(cat work/qemu.pid)"
               if ! kill -0 "$QEMU_PID" 2>/dev/null; then
-                echo "::error::QEMU exited before the VNC console became ready"
-                tail -n 200 work/qemu.log 2>/dev/null || true
+                echo "::error::QEMU exited before VNC became ready"
+                tail -n 200 work/qemu.log || true
                 exit 1
               fi
             fi
-
             sleep 2
           done
-
-          echo "::error::VNC console did not become ready within 180 seconds"
-          tail -n 200 work/qemu.log 2>/dev/null || true
+          echo "::error::VNC did not become ready within 180 seconds"
           exit 1
 
       - name: Wait for Windows RDP
         id: rdp
         continue-on-error: true
-        shell: bash
-        run: |
-          set -Eeuo pipefail
+        run: python3 scripts/libvm.py wait-rdp --timeout 900
 
-          echo "Waiting up to 15 minutes for Windows RDP..."
-          python3 scripts/libvm.py wait-rdp --timeout 900
-
-      - name: Show connection status
+      - name: Show Windows connection status
         if: always()
         shell: bash
         run: |
           set -Eeuo pipefail
-
-          echo "============================================================"
-          echo "WINDOWS VM CONNECTION STATUS"
-          echo
-          echo "VNC: ${{ steps.tailscale.outputs.ip }}:5900"
           echo "RDP: ${{ steps.tailscale.outputs.ip }}:3389"
-          echo
-
+          echo "Emergency VNC: ${{ steps.tailscale.outputs.ip }}:5900"
           if [[ "${{ steps.rdp.outcome }}" == "success" ]]; then
-            echo "RDP is ready."
+            echo "RDP is ready; VNC remains active as the emergency console."
           else
-            echo "WARNING: RDP is not ready."
-            echo "The workflow will remain running."
-            echo "Use VNC to inspect or repair Windows."
+            echo "::warning::RDP is not ready; use VNC to install NetKVM or repair Windows."
           fi
 
-          echo "============================================================"
-
-      - name: Configure automatic checkpoint interval
-        shell: bash
-        env:
-          CHECKPOINT_INTERVAL_MINUTES: ${{ inputs.checkpoint_interval_minutes }}
-        run: |
-          set -Eeuo pipefail
-
-          if [[ ! "$CHECKPOINT_INTERVAL_MINUTES" =~ ^[0-9]+$ ]]; then
-            echo "::error::checkpoint_interval_minutes must be a positive integer"
-            exit 1
-          fi
-
-          if (( CHECKPOINT_INTERVAL_MINUTES < 1 )); then
-            echo "::error::checkpoint_interval_minutes must be at least 1"
-            exit 1
-          fi
-
-          jq \
-            --argjson interval "$CHECKPOINT_INTERVAL_MINUTES" \
-            '.interval_minutes=$interval' \
-            config/checkpoint.json > config/checkpoint.json.tmp
-
-          mv config/checkpoint.json.tmp config/checkpoint.json
-
-          echo "Automatic checkpoint interval: ${CHECKPOINT_INTERVAL_MINUTES} minute(s)"
-          cat config/checkpoint.json
-
-      - name: Start checkpoint loop
+      - name: Run VM with periodic and forced final checkpoints
         shell: bash
         run: |
           set -Eeuo pipefail
-
-          nohup scripts/checkpoint/loop \
-            > logs/checkpoint-loop.log 2>&1 &
-
-          echo $! > work/checkpoint-loop.pid
-          echo "Checkpoint loop started with PID $(cat work/checkpoint-loop.pid)"
-
-      - name: Keep runtime alive until Windows shuts down
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          echo "============================================================"
-          echo "VM IS RUNNING"
-          echo
-          echo "RDP: ${{ steps.tailscale.outputs.ip }}:3389"
-          echo "VNC: ${{ steps.tailscale.outputs.ip }}:5900"
-          echo
-          echo "When Windows shuts down normally, the workflow will:"
-          echo "  1. Detect that QEMU exited"
-          echo "  2. Create an offline checkpoint"
-          echo "  3. Upload and verify latest persistent state"
-          echo "============================================================"
-
-          while true; do
-            sleep 15
-
-            QEMU_PID="$(cat work/qemu.pid 2>/dev/null || true)"
-
-            if [[ -z "$QEMU_PID" ]]; then
-              echo "QEMU PID file disappeared after Windows shutdown."
-              echo "Runtime is ending normally so cleanup can save the stopped overlay."
-              exit 0
-            fi
-
-            if ! kill -0 "$QEMU_PID" 2>/dev/null; then
-              echo "QEMU process $QEMU_PID has exited."
-              echo "Runtime is ending normally so cleanup can save the stopped overlay."
-              exit 0
-            fi
+          rm -f work/checkpoint-loop.stop work/final-checkpoint.done
+          scripts/checkpoint/loop \
+            > >(tee -a logs/checkpoint-loop.log) 2>&1 &
+          LOOP_PID=$!
+          for attempt in $(seq 1 50); do
+            [[ -f work/checkpoint-loop.pid ]] && break
+            sleep 0.1
           done
+          if [[ ! -f work/checkpoint-loop.pid ]]; then
+            echo "::error::Automatic checkpoint loop failed to start"
+            wait "$LOOP_PID"
+            exit 1
+          fi
+          scripts/runtime/supervise
+          wait "$LOOP_PID"
 
-      - name: Save final checkpoint after shutdown or workflow exit
+      - name: Best-effort finalization after failure or cancellation
         if: always()
-        timeout-minutes: 90
+        timeout-minutes: 55
         run: scripts/cleanup/cleanup
 
       - name: Upload runtime logs

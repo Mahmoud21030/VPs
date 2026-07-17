@@ -1,151 +1,136 @@
-# Persistent Windows VM on GitHub Actions
+# Persistent Windows VM in GitHub Actions
 
-## Installation
+This repository runs a persistent Windows virtual machine entirely inside a GitHub-hosted `ubuntu-latest` job. It uses QEMU/KVM with a Q35 machine, OVMF UEFI, an immutable QCOW2 base, a writable sparse QCOW2 overlay, VirtIO storage/networking, Tailscale, RDP, and a permanently available emergency VNC console.
 
-1. Create a private Backblaze B2 bucket.
-2. Enable S3-compatible access.
-3. Upload `base.qcow2` to `windows-vm/base.qcow2`.
-4. Add GitHub repository secrets:
-   - `B2_BUCKET`
-   - `B2_ENDPOINT`
-   - `B2_KEY_ID`
-   - `B2_APPLICATION_KEY`
-5. Run `.github/workflows/runtime.yml` manually.
-6. Connect to RDP on the forwarded runner port after the workflow reports RDP readiness.
+It is intentionally not a cloud VM, self-hosted runner, Windows runner, or Windows container.
 
-## Backblaze setup
+## Persistent object layout
 
-Create an application key with read/write access to the private bucket. Use the Backblaze S3 endpoint for the bucket region, for example `https://s3.us-west-004.backblazeb2.com`.
-
-Objects are stored under:
+Each selected bucket keeps one immutable base and one verified latest checkpoint:
 
 ```text
 windows-vm/base.qcow2
 windows-vm/latest/overlay.qcow2.zst
 windows-vm/latest/overlay.sha256
 windows-vm/latest/manifest.json
-windows-vm/checkpoints/checkpoint1/overlay.qcow2.zst
-windows-vm/checkpoints/checkpoint2/overlay.qcow2.zst
-windows-vm/checkpoints/checkpoint3/overlay.qcow2.zst
 ```
 
-## GitHub Secrets
+The runtime deletes obsolete objects only below `windows-vm/checkpoints/`. It never deletes `windows-vm/base.qcow2` or anything below `windows-vm/latest/`.
 
-`B2_BUCKET` is the private bucket name.
+## Required secrets
 
-`B2_ENDPOINT` is the S3 endpoint URL.
+Common Tailscale secrets:
 
-`B2_KEY_ID` is the Backblaze application key ID.
+- `TS_OAUTH_CLIENT_ID`
+- `TS_OAUTH_SECRET`
 
-`B2_APPLICATION_KEY` is the Backblaze application key value.
+The OAuth client must be allowed to create `tag:ci` devices.
 
-## Updating base image
-
-1. Stop all runtime workflows.
-2. Create a new Windows `base.qcow2` locally.
-3. Install VirtIO drivers, enable RDP, install LabVIEW, configure Windows, and shut down cleanly.
-4. Upload the new immutable base:
-
-```bash
-aws --endpoint-url "$B2_ENDPOINT" s3 cp base.qcow2 "s3://$B2_BUCKET/windows-vm/base.qcow2"
-```
-
-5. Delete or archive incompatible overlays if the base changed incompatibly.
-6. Start `runtime.yml`.
-
-## Running
-
-`runtime.yml` restores the latest valid overlay, creates one if absent, boots QEMU with UEFI, VirtIO disk, VirtIO networking, and RDP forwarding, then checkpoints every 120 minutes.
-
-`checkpoint.yml` performs a manual checkpoint.
-
-`maintenance.yml` restores and verifies stored state.
-
-## Recovery
-
-Restore order is automatic:
-
-1. `latest`
-2. `checkpoint1`
-3. `checkpoint2`
-4. `checkpoint3`
-
-If checksum verification fails, restore continues to the next checkpoint. If no overlay exists, a new overlay is created using `base.qcow2` as the immutable backing file.
-
-## Troubleshooting
-
-RDP not ready: verify Windows RDP is enabled, firewall allows port 3389, and VirtIO network drivers are installed.
-
-Checksum failure: inspect `logs/runtime.log`, verify Backblaze object consistency, and allow automatic rollback.
-
-QEMU boot failure: verify `base.qcow2`, UEFI firmware paths, KVM availability, and VirtIO drivers.
-
-Checkpoint failure: ensure QMP socket exists, Backblaze credentials are valid, bucket lifecycle rules are not deleting active objects, and available runner disk space exceeds the compacted overlay size plus compressed copy.
-
-## Tests
-
-```bash
-scripts/bootstrap/install.sh
-tests/run.sh
-```
-
-## Build and upload a minimal base image
-
-Use `.github/workflows/base-image.yml` to create `base.qcow2` from a Windows ISO and upload it to Backblaze B2. This base image is clean Windows only. It does not install LabVIEW.
-
-Required secrets:
+Backblaze B2:
 
 - `B2_BUCKET`
 - `B2_ENDPOINT`
 - `B2_KEY_ID`
 - `B2_APPLICATION_KEY`
-- `WINDOWS_ADMIN_PASSWORD`
+- Optional `B2_REGION`
 
-Run **Actions → build-base-image → Run workflow** with:
-
-- `windows_iso_url`: direct HTTPS URL to a Windows ISO
-- `virtio_iso_url`: direct HTTPS URL to `virtio-win.iso`
-- `disk_size`: base disk size such as `80G`
-- `memory_mb`: installer VM memory
-- `cpu_cores`: installer VM CPUs
-- `windows_iso_sha256`: optional checksum
-- `virtio_iso_sha256`: optional checksum
-
-The workflow creates `work/base.qcow2`, verifies it with `qemu-img check`, writes `work/base.sha256` and `work/base-manifest.json`, uploads `base.qcow2`, `base.sha256`, and `base-manifest.json` to the configured Backblaze B2 prefix, then downloads `base.qcow2` again and verifies the uploaded SHA256.
-
-
-## Selectable object storage: Backblaze B2 or Oracle OCI
-
-Every manual workflow now has a `storage_provider` choice:
-
-- `backblaze`
-- `oracle`
-
-The selected provider is used consistently for the base image, overlays, checksums, manifests, checkpoint rotation, restore, and upload verification.
-
-### Backblaze GitHub secrets
-
-- `B2_BUCKET`
-- `B2_ENDPOINT` including `https://`
-- `B2_KEY_ID`
-- `B2_APPLICATION_KEY`
-- Optional: `B2_REGION`
-
-### Oracle OCI Object Storage GitHub secrets
+Oracle Object Storage S3 compatibility API:
 
 - `ORACLE_BUCKET`
 - `ORACLE_NAMESPACE`
-- `ORACLE_REGION`, for example `eu-frankfurt-1`
-- `ORACLE_ACCESS_KEY_ID` — OCI Customer Secret Key access key
-- `ORACLE_SECRET_ACCESS_KEY` — OCI Customer Secret Key secret value
-- Optional: `ORACLE_ENDPOINT`
+- `ORACLE_REGION`
+- `ORACLE_ACCESS_KEY_ID`
+- `ORACLE_SECRET_ACCESS_KEY`
+- Optional `ORACLE_ENDPOINT`
 
-When `ORACLE_ENDPOINT` is omitted, the workflow derives:
+The Oracle access and secret values are OCI Customer Secret Keys, not OCI API-signing keys. When `ORACLE_ENDPOINT` is absent, the default is:
 
 ```text
 https://<namespace>.compat.objectstorage.<region>.oci.customer-oci.com
 ```
 
-The same `storage_provider` value must be selected for base creation and later runtime/checkpoint workflows so they read and write the same object store.
+All AWS CLI operations use path-style S3v4 requests and the `when_required` request/response checksum settings needed by Oracle-compatible endpoints.
 
-For scheduled maintenance, set the GitHub repository variable `STORAGE_PROVIDER` to `backblaze` or `oracle`; the default is `backblaze`.
+## Create the immutable Windows base
+
+Run `.github/workflows/base-image.yml`. Supply direct Windows and VirtIO ISO URLs, choose the target provider, and use VNC at the Tailscale address printed by the job. During Windows Setup, load the VirtIO storage driver from the mounted driver ISO if the disk is not visible. Install NetKVM for networking, enable RDP, finish configuration, and shut Windows down normally.
+
+The workflow validates, compacts, uploads, downloads, and SHA256-verifies `base.qcow2`. Normal runtime never modifies this object.
+
+The copy workflow `.github/workflows/copy-base-to-oracle.yml` can stage the Backblaze base locally, upload it to Oracle, download it again, and verify the full SHA256.
+
+## Run the VM
+
+Run `.github/workflows/runtime.yml` and select:
+
+- `storage_provider`: `backblaze` or `oracle`
+- `memory_mb`: default `15360`
+- `cpu_cores`: default `4`
+- `disk_size`: default `220G`; whole-GiB values strictly above `80G`
+- `checkpoint_interval_minutes`: default `15`; any positive integer
+- `compression_level`: default `10`; levels `1` through `22`
+- `forced_save_after_minutes`: default `300`; maximum `330`
+- `allow_fresh_overlay_if_missing`: default `false`
+- `virtio_iso_url` and optional `virtio_iso_sha256`
+
+The job prints its OS, CPU, logical CPU count, RAM, swap, block devices, filesystems, mount points, available capacity, and raw free bytes before checkout. It then places the physical VM working directory on the writable Linux filesystem with the most free space and symlinks repository `work/` to it. Linux mount points are discovered dynamically; no Windows-style host drive letters are assumed.
+
+Connection addresses are private Tailscale endpoints:
+
+```text
+RDP: <TAILSCALE_IP>:3389
+VNC: <TAILSCALE_IP>:5900
+```
+
+VNC remains active even when RDP works.
+
+## Restore safety
+
+Restore always downloads `base.qcow2`, directly downloads `latest/overlay.qcow2.zst`, downloads the SHA256 sidecar, verifies it, and only then decompresses and checks the overlay. It does not use a quiet `aws s3 ls` existence probe.
+
+Missing, inaccessible, corrupt, or undecompressible latest state fails the job by default. A blank overlay is created only when `allow_fresh_overlay_if_missing=true` was selected deliberately.
+
+## Disk growth
+
+The virtual disk is sparse QCOW2. Existing overlays smaller than the requested size are expanded before QEMU starts. Equal sizes are left unchanged, and shrinking is refused.
+
+After increasing `disk_size`, extend the Windows C: partition in Disk Management or an elevated PowerShell prompt, for example:
+
+```powershell
+$size = Get-PartitionSupportedSize -DriveLetter C
+Resize-Partition -DriveLetter C -Size $size.SizeMax
+```
+
+## Checkpoints and forced save
+
+Checkpoints use an inter-process lock and never overlap. The automatic loop waits for the configured interval, runs one checkpoint to completion, and then begins the next wait. A failed automatic checkpoint is logged and the loop continues.
+
+For a running guest, QEMU QMP `drive-backup` creates a full point-in-time QCOW2 target with `sync=full`. The job is monitored to a successful concluded state and dismissed. Only that completed target is checked and converted back into a sparse overlay backed by the immutable base.
+
+After normal Windows shutdown, the missing QEMU PID/QMP socket is expected. The inactive overlay is checked, compacted only when sufficient temporary capacity exists, compressed, uploaded, downloaded again, and SHA256-verified.
+
+At approximately 300 minutes from job start, the supervisor stops the automatic loop cleanly, completes a final online checkpoint, verifies the remote bytes, shuts QEMU down, and ends normally. GitHub cancellation cleanup is only best effort because the hosted runner can terminate compression or upload with signal 143.
+
+## Compression
+
+Compression writes `overlay.qcow2.zst.tmp` and renames it only after zstd succeeds. Upload never starts until compression is complete. Levels above 19 add `--ultra`.
+
+Higher levels can reduce stored bytes but cost more CPU, memory, and time. Level 10 is the recommended balance. Levels 19 or 22 may not complete before the job is terminated.
+
+## VirtIO drivers in Windows
+
+The VirtIO ISO is mounted read-only at every runtime boot. In an elevated Windows terminal, drivers can be installed recursively with:
+
+```cmd
+pnputil /add-driver "D:\*.inf" /subdirs /install
+```
+
+The actual CD drive letter may differ. NetKVM is the most important network driver for RDP connectivity.
+
+## Local validation
+
+```bash
+python3 -m py_compile scripts/libvm.py scripts/libbase.py tests/test_core.py
+bash -n scripts/**/*.sh tests/run.sh
+tests/run.sh
+```

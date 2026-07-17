@@ -30,7 +30,7 @@ Automatic checkpoint interval:
 
 Previous fixes preserved:
   - Oracle checksum/chunked-upload compatibility
-  - Oracle S3-to-S3 rotation --copy-props none
+  - Oracle S3-to-S3 copy compatibility with --copy-props none
   - normal Windows shutdown offline save
   - checkpoint lock
   - 220G/resizable disk support

@@ -1,0 +1,47 @@
+name: validate
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Show runner operating system CPU RAM swap and storage
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          uname -a
+          cat /etc/os-release
+          lscpu
+          echo "Logical CPU count: $(nproc)"
+          free -h
+          grep -E 'MemTotal|MemAvailable|SwapTotal|SwapFree' /proc/meminfo
+          lsblk -o NAME,TYPE,SIZE,FSTYPE,FSAVAIL,MOUNTPOINTS
+          df -hT
+          df -B1 -P
+
+      - uses: actions/checkout@v4
+      - run: scripts/bootstrap/install.sh
+      - name: Validate Python shell YAML and unit tests
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 -m py_compile scripts/libvm.py scripts/libbase.py tests/test_core.py
+          find scripts tests -type f ! -name '*.py' ! -name '*.pyc' -print0 \
+            | xargs -0 -r -n1 bash -n
+          python3 - <<'PY'
+          from pathlib import Path
+          import yaml
+          for path in sorted(Path('.github/workflows').glob('*.yml')):
+              data = yaml.load(path.read_text(encoding='utf-8'), Loader=yaml.BaseLoader)
+              if not isinstance(data, dict) or 'on' not in data or 'jobs' not in data:
+                  raise SystemExit(f'invalid workflow structure: {path}')
+              print(f'validated YAML: {path}')
+          PY
+          tests/run.sh

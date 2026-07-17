@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       object_prefix:
-        description: Object prefix containing the base image
+        description: Object prefix containing base.qcow2
         required: false
         default: windows-vm
         type: string
@@ -17,350 +17,169 @@ jobs:
   copy:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-
     env:
       B2_BUCKET: ${{ secrets.B2_BUCKET }}
       B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
       B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
       B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
-
+      B2_REGION: ${{ secrets.B2_REGION }}
       ORACLE_BUCKET: ${{ secrets.ORACLE_BUCKET }}
       ORACLE_NAMESPACE: ${{ secrets.ORACLE_NAMESPACE }}
       ORACLE_REGION: ${{ secrets.ORACLE_REGION }}
       ORACLE_ACCESS_KEY_ID: ${{ secrets.ORACLE_ACCESS_KEY_ID }}
       ORACLE_SECRET_ACCESS_KEY: ${{ secrets.ORACLE_SECRET_ACCESS_KEY }}
       ORACLE_ENDPOINT_OVERRIDE: ${{ secrets.ORACLE_ENDPOINT }}
-
       OBJECT_PREFIX: ${{ inputs.object_prefix }}
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      AWS_EC2_METADATA_DISABLED: "true"
 
     steps:
-      - name: Validate configuration
+      - name: Show runner operating system CPU RAM swap and storage
         shell: bash
         run: |
           set -Eeuo pipefail
+          uname -a
+          cat /etc/os-release
+          lscpu
+          echo "Logical CPU count: $(nproc)"
+          free -h
+          grep -E 'MemTotal|MemAvailable|SwapTotal|SwapFree' /proc/meminfo
+          lsblk -o NAME,TYPE,SIZE,FSTYPE,FSAVAIL,MOUNTPOINTS
+          df -hT
+          df -B1 -P
 
-          required_vars=(
-            B2_BUCKET
-            B2_ENDPOINT
-            B2_KEY_ID
-            B2_APPLICATION_KEY
-            ORACLE_BUCKET
-            ORACLE_NAMESPACE
-            ORACLE_REGION
-            ORACLE_ACCESS_KEY_ID
-            ORACLE_SECRET_ACCESS_KEY
-            OBJECT_PREFIX
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Use largest writable filesystem for base staging
+        run: scripts/bootstrap/prepare-work-drive.sh
+
+      - name: Install host dependencies
+        run: scripts/bootstrap/install.sh
+
+      - name: Validate endpoints and configure AWS CLI compatibility
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          required=(
+            B2_BUCKET B2_ENDPOINT B2_KEY_ID B2_APPLICATION_KEY
+            ORACLE_BUCKET ORACLE_NAMESPACE ORACLE_REGION
+            ORACLE_ACCESS_KEY_ID ORACLE_SECRET_ACCESS_KEY OBJECT_PREFIX
           )
-
-          for name in "${required_vars[@]}"; do
+          for name in "${required[@]}"; do
             if [[ -z "${!name:-}" ]]; then
-              echo "::error::Missing required value: ${name}"
+              echo "::error::Missing required value: $name"
               exit 1
             fi
           done
-
-          if [[ -n "${ORACLE_ENDPOINT_OVERRIDE:-}" ]]; then
-            ORACLE_ENDPOINT="${ORACLE_ENDPOINT_OVERRIDE}"
-          else
-            ORACLE_ENDPOINT="https://${ORACLE_NAMESPACE}.compat.objectstorage.${ORACLE_REGION}.oraclecloud.com"
+          if [[ "$OBJECT_PREFIX" == /* || "$OBJECT_PREFIX" == *".."* ]]; then
+            echo "::error::object_prefix must be a safe relative object prefix"
+            exit 1
           fi
-
           case "$B2_ENDPOINT" in
             http://*|https://*) ;;
-            *)
-              echo "::error::B2_ENDPOINT must start with http:// or https://"
-              exit 1
-              ;;
+            *) echo "::error::B2_ENDPOINT must start with http:// or https://"; exit 1 ;;
           esac
-
+          B2_RESOLVED_REGION="$B2_REGION"
+          if [[ -z "$B2_RESOLVED_REGION" ]]; then
+            b2_host="${B2_ENDPOINT#*://}"
+            b2_host="${b2_host%%/*}"
+            B2_RESOLVED_REGION="${b2_host#s3.}"
+            B2_RESOLVED_REGION="${B2_RESOLVED_REGION%%.backblazeb2.com}"
+            if [[ "$B2_RESOLVED_REGION" == "$b2_host" ]]; then
+              B2_RESOLVED_REGION="us-east-1"
+            fi
+          fi
+          echo "B2_RESOLVED_REGION=$B2_RESOLVED_REGION" >> "$GITHUB_ENV"
+          if [[ -n "$ORACLE_ENDPOINT_OVERRIDE" ]]; then
+            ORACLE_ENDPOINT="$ORACLE_ENDPOINT_OVERRIDE"
+          else
+            ORACLE_ENDPOINT="https://${ORACLE_NAMESPACE}.compat.objectstorage.${ORACLE_REGION}.oci.customer-oci.com"
+          fi
           case "$ORACLE_ENDPOINT" in
             http://*|https://*) ;;
-            *)
-              echo "::error::ORACLE_ENDPOINT must start with http:// or https://"
-              exit 1
-              ;;
+            *) echo "::error::ORACLE_ENDPOINT must start with http:// or https://"; exit 1 ;;
           esac
-
-          echo "ORACLE_ENDPOINT=${ORACLE_ENDPOINT}" >> "$GITHUB_ENV"
-
-          echo "Source:      s3://${B2_BUCKET}/${OBJECT_PREFIX}/base.qcow2"
-          echo "Destination: s3://${ORACLE_BUCKET}/${OBJECT_PREFIX}/base.qcow2"
-          echo "Oracle endpoint: ${ORACLE_ENDPOINT}"
-
-      - name: Install AWS CLI v2
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          if command -v aws >/dev/null 2>&1; then
-            aws --version
-            exit 0
-          fi
-
-          tmp_dir="$(mktemp -d)"
-          trap 'rm -rf "$tmp_dir"' EXIT
-
-          curl \
-            --fail \
-            --location \
-            --retry 5 \
-            --retry-delay 3 \
-            --retry-all-errors \
-            "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" \
-            --output "${tmp_dir}/awscliv2.zip"
-
-          unzip -q "${tmp_dir}/awscliv2.zip" -d "$tmp_dir"
-          sudo "${tmp_dir}/aws/install"
-
-          aws --version
-
-      - name: Configure S3-compatible addressing
-        shell: bash
-        run: |
-          set -Eeuo pipefail
+          echo "ORACLE_ENDPOINT=$ORACLE_ENDPOINT" >> "$GITHUB_ENV"
 
           mkdir -p "$RUNNER_TEMP/aws"
-
           cat > "$RUNNER_TEMP/aws/config" <<'EOF'
           [default]
-          region = us-east-1
           request_checksum_calculation = when_required
           response_checksum_validation = when_required
           s3 =
             addressing_style = path
             signature_version = s3v4
           EOF
-
           echo "AWS_CONFIG_FILE=$RUNNER_TEMP/aws/config" >> "$GITHUB_ENV"
-          echo "AWS_EC2_METADATA_DISABLED=true" >> "$GITHUB_ENV"
-          echo "AWS_REQUEST_CHECKSUM_CALCULATION=when_required" >> "$GITHUB_ENV"
-          echo "AWS_RESPONSE_CHECKSUM_VALIDATION=when_required" >> "$GITHUB_ENV"
 
-      - name: Download base image from Backblaze
+      - name: Copy immutable base through verified local staging
         shell: bash
         run: |
           set -Eeuo pipefail
-
-          mkdir -p work
-
           retry() {
-            local max_attempts="$1"
+            local attempts="$1" delay=3 n
             shift
-            local delay=3
-            local attempt
-
-            for attempt in $(seq 1 "$max_attempts"); do
-              if "$@"; then
-                return 0
-              fi
-
-              if (( attempt == max_attempts )); then
-                echo "::error::Command failed after ${max_attempts} attempts"
+            for n in $(seq 1 "$attempts"); do
+              if "$@"; then return 0; fi
+              if (( n == attempts )); then
+                echo "::error::Command failed after $attempts attempts"
                 return 1
               fi
-
-              echo "Attempt ${attempt}/${max_attempts} failed; retrying in ${delay}s..."
+              echo "Attempt $n/$attempts failed; retrying in ${delay}s"
               sleep "$delay"
-
-              if (( delay < 48 )); then
-                delay=$((delay * 2))
-              fi
+              delay=$((delay * 2))
+              (( delay > 48 )) && delay=48
             done
           }
-
           b2_aws() {
             env \
               AWS_ACCESS_KEY_ID="$B2_KEY_ID" \
               AWS_SECRET_ACCESS_KEY="$B2_APPLICATION_KEY" \
-              AWS_DEFAULT_REGION="us-east-1" \
-              aws \
-                --endpoint-url "$B2_ENDPOINT" \
-                "$@"
+              AWS_DEFAULT_REGION="$B2_RESOLVED_REGION" \
+              aws --endpoint-url "$B2_ENDPOINT" "$@"
+          }
+          oracle_aws() {
+            env \
+              AWS_ACCESS_KEY_ID="$ORACLE_ACCESS_KEY_ID" \
+              AWS_SECRET_ACCESS_KEY="$ORACLE_SECRET_ACCESS_KEY" \
+              AWS_DEFAULT_REGION="$ORACLE_REGION" \
+              AWS_REQUEST_CHECKSUM_CALCULATION=when_required \
+              AWS_RESPONSE_CHECKSUM_VALIDATION=when_required \
+              AWS_EC2_METADATA_DISABLED=true \
+              aws --endpoint-url "$ORACLE_ENDPOINT" "$@"
           }
 
-          retry 5 b2_aws \
-            s3 cp \
+          base="work/base.qcow2"
+          base_tmp="${base}.download.tmp"
+          verify="work/oracle-base.verify.qcow2.tmp"
+          rm -f "$base_tmp" "$verify"
+
+          retry 5 b2_aws s3 cp \
             "s3://${B2_BUCKET}/${OBJECT_PREFIX}/base.qcow2" \
-            "work/base.qcow2" \
-            --only-show-errors
+            "$base_tmp"
+          mv "$base_tmp" "$base"
+          qemu-img check "$base"
+          source_sha="$(sha256sum "$base" | awk '{print $1}')"
+          echo "Backblaze base SHA256: $source_sha"
 
-          retry 5 b2_aws \
-            s3 cp \
-            "s3://${B2_BUCKET}/${OBJECT_PREFIX}/base.sha256" \
-            "work/base.sha256" \
-            --only-show-errors
+          retry 5 oracle_aws s3 cp \
+            "$base" \
+            "s3://${ORACLE_BUCKET}/${OBJECT_PREFIX}/base.qcow2"
 
-          if b2_aws \
-            s3 cp \
-            "s3://${B2_BUCKET}/${OBJECT_PREFIX}/base-manifest.json" \
-            "work/base-manifest.json" \
-            --only-show-errors; then
-            echo "Downloaded optional base-manifest.json"
-          else
-            echo "::warning::base-manifest.json was not found; continuing without it"
-          fi
-
-          echo "Downloaded files:"
-          ls -lh work/
-
-      - name: Verify source SHA256
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          expected="$(awk 'NF {print $1; exit}' work/base.sha256 | tr '[:upper:]' '[:lower:]')"
-
-          if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "::error::Invalid SHA256 value in work/base.sha256"
-            exit 1
-          fi
-
-          actual="$(sha256sum work/base.qcow2 | awk '{print $1}')"
-
-          echo "Expected SHA256: $expected"
-          echo "Actual SHA256:   $actual"
-
-          if [[ "$actual" != "$expected" ]]; then
-            echo "::error::Source base image SHA256 verification failed"
-            exit 1
-          fi
-
-          printf '%s  %s\n' "$actual" "base.qcow2" > work/base.sha256.normalized
-          mv work/base.sha256.normalized work/base.sha256
-
-          echo "Source SHA256 verification passed"
-
-      - name: Upload base image to Oracle Object Storage
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          retry() {
-            local max_attempts="$1"
-            shift
-            local delay=3
-            local attempt
-
-            for attempt in $(seq 1 "$max_attempts"); do
-              if "$@"; then
-                return 0
-              fi
-
-              if (( attempt == max_attempts )); then
-                echo "::error::Command failed after ${max_attempts} attempts"
-                return 1
-              fi
-
-              echo "Attempt ${attempt}/${max_attempts} failed; retrying in ${delay}s..."
-              sleep "$delay"
-
-              if (( delay < 48 )); then
-                delay=$((delay * 2))
-              fi
-            done
-          }
-
-          oracle_aws() {
-            env \
-              AWS_ACCESS_KEY_ID="$ORACLE_ACCESS_KEY_ID" \
-              AWS_SECRET_ACCESS_KEY="$ORACLE_SECRET_ACCESS_KEY" \
-              AWS_DEFAULT_REGION="$ORACLE_REGION" \
-              AWS_REQUEST_CHECKSUM_CALCULATION="when_required" \
-              AWS_RESPONSE_CHECKSUM_VALIDATION="when_required" \
-              AWS_EC2_METADATA_DISABLED="true" \
-              aws \
-                --endpoint-url "$ORACLE_ENDPOINT" \
-                "$@"
-          }
-
-          retry 5 oracle_aws \
-            s3 cp \
-            "work/base.qcow2" \
+          retry 5 oracle_aws s3 cp \
             "s3://${ORACLE_BUCKET}/${OBJECT_PREFIX}/base.qcow2" \
-            --only-show-errors
-
-          retry 5 oracle_aws \
-            s3 cp \
-            "work/base.sha256" \
-            "s3://${ORACLE_BUCKET}/${OBJECT_PREFIX}/base.sha256" \
-            --only-show-errors
-
-          if [[ -f work/base-manifest.json ]]; then
-            retry 5 oracle_aws \
-              s3 cp \
-              "work/base-manifest.json" \
-              "s3://${ORACLE_BUCKET}/${OBJECT_PREFIX}/base-manifest.json" \
-              --only-show-errors
-          fi
-
-          echo "Oracle upload completed"
-
-      - name: Verify Oracle upload
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          oracle_aws() {
-            env \
-              AWS_ACCESS_KEY_ID="$ORACLE_ACCESS_KEY_ID" \
-              AWS_SECRET_ACCESS_KEY="$ORACLE_SECRET_ACCESS_KEY" \
-              AWS_DEFAULT_REGION="$ORACLE_REGION" \
-              AWS_REQUEST_CHECKSUM_CALCULATION="when_required" \
-              AWS_RESPONSE_CHECKSUM_VALIDATION="when_required" \
-              AWS_EC2_METADATA_DISABLED="true" \
-              aws \
-                --endpoint-url "$ORACLE_ENDPOINT" \
-                "$@"
-          }
-
-          local_size="$(stat -c '%s' work/base.qcow2)"
-
-          remote_size="$(
-            oracle_aws \
-              s3api head-object \
-              --bucket "$ORACLE_BUCKET" \
-              --key "${OBJECT_PREFIX}/base.qcow2" \
-              --query 'ContentLength' \
-              --output text
-          )"
-
-          echo "Local size:  $local_size bytes"
-          echo "Remote size: $remote_size bytes"
-
-          if [[ "$local_size" != "$remote_size" ]]; then
-            echo "::error::Oracle object size verification failed"
+            "$verify"
+          oracle_sha="$(sha256sum "$verify" | awk '{print $1}')"
+          echo "Oracle base SHA256:    $oracle_sha"
+          if [[ "$source_sha" != "$oracle_sha" ]]; then
+            echo "::error::Oracle base verification failed"
             exit 1
           fi
+          rm -f "$verify"
+          echo "Immutable base copied to Oracle and verified successfully"
 
-          oracle_aws \
-            s3 cp \
-            "s3://${ORACLE_BUCKET}/${OBJECT_PREFIX}/base.sha256" \
-            "work/oracle-base.sha256" \
-            --only-show-errors
-
-          expected="$(awk 'NF {print $1; exit}' work/base.sha256)"
-          oracle_checksum="$(awk 'NF {print $1; exit}' work/oracle-base.sha256)"
-
-          if [[ "$expected" != "$oracle_checksum" ]]; then
-            echo "::error::Oracle checksum sidecar verification failed"
-            exit 1
-          fi
-
-          oracle_aws \
-            s3api head-object \
-            --bucket "$ORACLE_BUCKET" \
-            --key "${OBJECT_PREFIX}/base.qcow2" \
-            --output json
-
-          echo "============================================================"
-          echo "COPY COMPLETED SUCCESSFULLY"
-          echo
-          echo "Source:"
-          echo "  s3://${B2_BUCKET}/${OBJECT_PREFIX}/base.qcow2"
-          echo
-          echo "Oracle destination:"
-          echo "  s3://${ORACLE_BUCKET}/${OBJECT_PREFIX}/base.qcow2"
-          echo
-          echo "SHA256:"
-          echo "  ${expected}"
-          echo "============================================================"
+          # If a future edit introduces an S3-to-S3 cp, it must add
+          # --copy-props none. This workflow currently stages locally because
+          # the source and destination require different endpoints/credentials.

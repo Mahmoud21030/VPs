@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
+import argparse
+import datetime
 import fcntl
-import argparse, datetime, hashlib, json, os, re, shutil, socket, subprocess, sys, time
+import hashlib
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import time
 from pathlib import Path
 ROOT=Path(os.environ.get('ROOT_DIR', Path(__file__).resolve().parents[1]))
 WORK=ROOT/'work'; LOGS=ROOT/'logs'
@@ -71,11 +80,30 @@ def sha256(path):
     with open(path,'rb') as f:
         for b in iter(lambda:f.read(1024*1024), b''): h.update(b)
     return h.hexdigest()
+def atomic_write_text(path, content):
+    path=Path(path)
+    tmp=Path(str(path)+'.tmp')
+    tmp.unlink(missing_ok=True)
+    try:
+        with tmp.open('w',encoding='utf-8') as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
 def write_sha(path, out):
-    d=sha256(path); Path(out).write_text(f"{d}  {Path(path).name}\n", encoding='utf-8'); return d
+    d=sha256(path)
+    atomic_write_text(out,f"{d}  {Path(path).name}\n")
+    return d
 def verify_sha(path, sha_file):
     expected=Path(sha_file).read_text(encoding='utf-8').split()[0].lower(); got=sha256(path).lower()
-    if expected!=got: raise SystemExit(f"checksum mismatch for {path}: expected {expected}, got {got}")
+    if not re.fullmatch(r'[0-9a-f]{64}',expected):
+        raise RuntimeError(f'invalid SHA256 sidecar: {sha_file}')
+    if expected!=got:
+        raise RuntimeError(
+            f"checksum mismatch for {path}: expected {expected}, got {got}"
+        )
     log(f"sha256 verified: {path}")
 def aws_env():
     context = storage_context()
@@ -113,16 +141,16 @@ def aws_cp(src, dst):
     # AWS CLI v2 tries to preserve tags and metadata during S3-to-S3
     # multipart copies. That can trigger HeadObject/GetObjectTagging/
     # PutObjectTagging calls, which are not supported by every S3-
-    # compatible provider. For checkpoint rotation we only need the
-    # object bytes, so disable property copying explicitly.
+    # compatible provider. For any S3-to-S3 copy we only need the object
+    # bytes, so disable property copying explicitly.
     if str(src).startswith('s3://') and str(dst).startswith('s3://'):
         cmd.extend(['--copy-props', 'none'])
         log(f'remote object copy without tags/metadata: {src} -> {dst}')
 
+    # Keep AWS CLI progress and error output visible. In particular, restore
+    # failures must show the complete provider error rather than being hidden
+    # behind an existence probe or --only-show-errors.
     return run(cmd, env=aws_env())
-def aws_ls(uri): return subprocess.run(['aws','--endpoint-url',endpoint(),'s3','ls',uri], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=aws_env()).returncode==0
-def aws_rm(uri): return run(['aws','--endpoint-url',endpoint(),'s3','rm',uri,'--only-show-errors'], env=aws_env(), check=False)
-
 def aws_rm_recursive(uri):
     return run(
         [
@@ -135,14 +163,46 @@ def aws_rm_recursive(uri):
         env=aws_env(),
     )
 def compress(src,dst):
-    c=cfg('checkpoint.json'); threads=str(c.get('zstd_threads',0)); level='-'+str(c.get('compression_level',10))
-    tmp=str(dst)+'.tmp'; Path(tmp).unlink(missing_ok=True)
-    run(['zstd','-T'+threads,level,'--force','--rm','-o',tmp,src])
-    Path(tmp).replace(dst); log(f"compressed {src} -> {dst}")
+    c=cfg('checkpoint.json')
+    threads=str(c.get('zstd_threads',0))
+    compression_level=int(c.get('compression_level',10))
+    if not 1 <= compression_level <= 22:
+        raise ValueError(
+            f'compression_level must be between 1 and 22; got {compression_level}'
+        )
+
+    tmp=Path(str(dst)+'.tmp')
+    tmp.unlink(missing_ok=True)
+    command=['zstd','-T'+threads]
+    if compression_level > 19:
+        command.append('--ultra')
+    command.extend([
+        '-'+str(compression_level),
+        '--force',
+        '-o',str(tmp),
+        str(src),
+    ])
+
+    try:
+        run(command)
+        tmp.replace(dst)
+    finally:
+        # A terminated or failed compression must never leave a temporary
+        # archive that a later checkpoint could mistake for valid state.
+        tmp.unlink(missing_ok=True)
+
+    log(
+        f"compressed {src} -> {dst} with zstd level {compression_level}"
+    )
 def decompress(src,dst):
-    tmp=str(dst)+'.tmp'; Path(tmp).unlink(missing_ok=True)
-    run(['zstd','-d','--force','--rm','-o',tmp,src])
-    Path(tmp).replace(dst); log(f"decompressed {src} -> {dst}")
+    tmp=Path(str(dst)+'.tmp')
+    tmp.unlink(missing_ok=True)
+    try:
+        run(['zstd','-d','--force','-o',tmp,src])
+        tmp.replace(dst)
+    finally:
+        tmp.unlink(missing_ok=True)
+    log(f"decompressed {src} -> {dst}")
 def parse_qemu_size(value):
     text=str(value).strip().upper()
     match=re.fullmatch(r'([1-9][0-9]*)([KMGTPE]?)B?', text)
@@ -153,13 +213,16 @@ def parse_qemu_size(value):
     power={'':0,'K':1,'M':2,'G':3,'T':4,'P':5,'E':6}[unit]
     return number*(1024**power)
 
-def qemu_virtual_size(path):
+def qemu_image_info(path):
     result=run(
         ['qemu-img','info','--output=json',path],
         stdout=subprocess.PIPE,
     )
-    info=json.loads(result.stdout)
-    return int(info['virtual-size'])
+    return json.loads(result.stdout)
+
+
+def qemu_virtual_size(path):
+    return int(qemu_image_info(path)['virtual-size'])
 
 def ensure_virtual_disk_size(path, requested_size):
     target_bytes=parse_qemu_size(requested_size)
@@ -201,12 +264,116 @@ def ensure_virtual_disk_size(path, requested_size):
     log(f"virtual disk expanded successfully to {requested_size}")
 
 def create_overlay(base, overlay):
-    Path(overlay).parent.mkdir(parents=True, exist_ok=True)
-    if Path(overlay).exists(): return
-    run(['qemu-img','create','-f','qcow2','-F','qcow2','-b',base,overlay])
-    log(f"created overlay {overlay}")
+    base=Path(base)
+    overlay=Path(overlay)
+    overlay.parent.mkdir(parents=True, exist_ok=True)
+    if overlay.exists():
+        return
+    backing=os.path.relpath(base, overlay.parent)
+    run(
+        [
+            'qemu-img','create','-f','qcow2','-F','qcow2',
+            '-b',backing,overlay.name,
+        ],
+        cwd=overlay.parent,
+    )
+    log(f"created sparse overlay {overlay} backed by immutable {base}")
+
+
+def require_temporary_space(directory, required_bytes, operation):
+    available=shutil.disk_usage(directory).free
+    log(
+        f'temporary space check for {operation}: '
+        f'required={required_bytes} available={available} bytes'
+    )
+    if available < required_bytes:
+        raise RuntimeError(
+            f'insufficient temporary disk space for {operation}: '
+            f'required={required_bytes} available={available} bytes'
+        )
+
+
+def converted_overlay_space_required(source):
+    info=qemu_image_info(source)
+    actual_size=int(info.get('actual-size') or Path(source).stat().st_size)
+    # Leave room for QCOW2 metadata growth while converting. The output is
+    # sparse and backed by the immutable base, so changed allocated clusters
+    # are the main space requirement.
+    return max(actual_size + 1024**3, 2 * 1024**3)
+
+
+def convert_to_backed_overlay(source, base, destination):
+    source=Path(source)
+    base=Path(base)
+    destination=Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.unlink(missing_ok=True)
+    require_temporary_space(
+        destination.parent,
+        converted_overlay_space_required(source),
+        'QCOW2 backed-overlay conversion',
+    )
+
+    source_arg=os.path.relpath(source, destination.parent)
+    backing_arg=os.path.relpath(base, destination.parent)
+    try:
+        run(
+            [
+                'qemu-img','convert','-p','-O','qcow2','-c',
+                '-B',backing_arg,'-F','qcow2',
+                source_arg,destination.name,
+            ],
+            cwd=destination.parent,
+        )
+        run(['qemu-img','check',destination])
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+
+    log(
+        f'created sparse persistent overlay {destination} '
+        f'backed by immutable {base}'
+    )
+
+
+def normalize_overlay_backing(overlay, base):
+    """Keep restored overlays attached to the immutable base safely.
+
+    Current checkpoints already have a backing file and only need their
+    relative backing path updated for this runner. Legacy standalone images
+    are converted so unallocated clusters retain their original zero/data
+    semantics; blindly adding a backing file with rebase -u would be unsafe.
+    """
+    overlay=Path(overlay)
+    base=Path(base)
+    info=qemu_image_info(overlay)
+    backing=info.get('backing-filename')
+
+    if backing:
+        backing_arg=os.path.relpath(base, overlay.parent)
+        run(
+            [
+                'qemu-img','rebase','-u','-f','qcow2','-F','qcow2',
+                '-b',backing_arg,overlay.name,
+            ],
+            cwd=overlay.parent,
+        )
+        log(f'updated restored overlay backing path to {backing_arg}')
+        return
+
+    log('legacy standalone checkpoint detected; converting to a backed overlay')
+    converted=overlay.with_name(overlay.name+'.backed.tmp')
+    try:
+        convert_to_backed_overlay(overlay,base,converted)
+        converted.replace(overlay)
+    finally:
+        converted.unlink(missing_ok=True)
 class QMP:
-    def __init__(self, sock_path, timeout=20): self.sock_path=str(sock_path); self.timeout=timeout; self.s=None
+    def __init__(self, sock_path, timeout=20):
+        self.sock_path=str(sock_path)
+        self.timeout=timeout
+        self.s=None
+        self.buffer=b''
     def __enter__(self):
         deadline=time.time()+self.timeout
         while True:
@@ -220,11 +387,22 @@ class QMP:
         try: self.s.close()
         except Exception: pass
     def _recv(self):
-        data=b''
-        while True:
-            chunk=self.s.recv(65536); data+=chunk
-            if b'\r\n' in data or b'\n' in data: break
-        return [json.loads(x) for x in data.replace(b'\r',b'').split(b'\n') if x.strip()]
+        messages=[]
+        while not messages:
+            while b'\n' not in self.buffer:
+                chunk=self.s.recv(65536)
+                if not chunk:
+                    raise ConnectionError('QMP socket closed before a response')
+                self.buffer+=chunk
+
+            lines=self.buffer.split(b'\n')
+            self.buffer=lines.pop()
+            for line in lines:
+                line=line.rstrip(b'\r')
+                if line.strip():
+                    messages.append(json.loads(line))
+
+        return messages
     def cmd(self, execute, arguments=None):
         msg={'execute':execute}
         if arguments is not None: msg['arguments']=arguments
@@ -278,7 +456,10 @@ def boot():
         '-drive',f"file={overlay},if=virtio,format=qcow2,cache=writeback,discard=unmap,id={v['disk_id']}",
         '-drive',f"if=none,id=virtiocd,file={virtio_iso},format=raw,media=cdrom,readonly=on",
         '-device','ide-cd,drive=virtiocd',
-        '-netdev',f"user,id={v['network_user_id']},hostfwd=tcp::{v['rdp_host_port']}-:{v['rdp_guest_port']}",
+        '-netdev',(
+            f"user,id={v['network_user_id']},"
+            f"hostfwd=tcp:0.0.0.0:{v['rdp_host_port']}-:{v['rdp_guest_port']}"
+        ),
         '-device',f"virtio-net-pci,netdev={v['network_user_id']}",
         '-qmp',f"unix:{sock},server=on,wait=off",
         '-pidfile',str(pid),
@@ -334,15 +515,38 @@ def wait_for_qemu_exit(v=None, timeout=30):
     return not qemu_is_running(v)
 
 def shutdown():
-    try: qmp_cmd('system_powerdown'); log('qmp system_powerdown sent')
-    except Exception as e: log(f'qmp shutdown failed: {e}')
+    if not qemu_is_running():
+        log('QEMU is already stopped; no QMP shutdown command is needed')
+        return
+
+    qmp_cmd('system_powerdown')
+    log('qmp system_powerdown sent')
     pid=ROOT/cfg('vm.json')['pid_file']
     if pid.exists():
         p=int(pid.read_text().strip());
-        for _ in range(120):
-            if subprocess.run(['kill','-0',str(p)], stderr=subprocess.DEVNULL).returncode!=0: return
+        for _ in range(60):
+            if subprocess.run(
+                ['kill','-0',str(p)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ).returncode!=0:
+                log('QEMU exited after ACPI shutdown')
+                return
             time.sleep(5)
-        raise SystemExit('qemu did not exit after ACPI shutdown')
+        log(
+            'Windows did not complete ACPI shutdown within 300 seconds; '
+            'requesting QEMU quit after the verified final checkpoint'
+        )
+        try:
+            qmp_cmd('quit')
+        except Exception:
+            if qemu_is_running():
+                raise
+            log('QMP connection closed as QEMU processed the quit command')
+        if wait_for_qemu_exit(timeout=30):
+            log('QEMU exited after QMP quit')
+            return
+        raise SystemExit('QEMU did not exit after ACPI shutdown and QMP quit')
 def wait_for_qmp_backup_job(job_id, timeout_seconds):
     deadline = time.time() + timeout_seconds
     last_progress_log = 0.0
@@ -366,30 +570,14 @@ def wait_for_qmp_backup_job(job_id, timeout_seconds):
         now = time.time()
         if now - last_progress_log >= 15:
             progress_text = ''
-
-            try:
-                block_jobs = qmp_cmd('query-block-jobs')
-                block_job = next(
-                    (
-                        item
-                        for item in block_jobs
-                        if item.get('device') == job_id
-                    ),
-                    None,
+            total = int(job.get('total-progress') or 0)
+            current = int(job.get('current-progress') or 0)
+            if total > 0:
+                percent = (current * 100.0) / total
+                progress_text = (
+                    f' progress={percent:.1f}% '
+                    f'({current}/{total})'
                 )
-
-                if block_job:
-                    total = int(block_job.get('len') or 0)
-                    offset = int(block_job.get('offset') or 0)
-
-                    if total > 0:
-                        percent = (offset * 100.0) / total
-                        progress_text = (
-                            f' progress={percent:.1f}% '
-                            f'({offset}/{total} bytes)'
-                        )
-            except Exception as e:
-                progress_text = f' progress unavailable: {e}'
 
             log(
                 f'live backup job {job_id}: '
@@ -399,15 +587,8 @@ def wait_for_qmp_backup_job(job_id, timeout_seconds):
 
         if status == 'concluded':
             error = job.get('error')
-
-            try:
-                qmp_cmd('job-dismiss', {'id': job_id})
-            except Exception as dismiss_error:
-                log(
-                    f'live backup job dismiss warning for {job_id}: '
-                    f'{dismiss_error}'
-                )
-
+            qmp_cmd('job-dismiss', {'id': job_id})
+            log(f'live backup job dismissed: {job_id}')
             if error:
                 raise RuntimeError(
                     f'live backup job {job_id!r} failed: {error}'
@@ -436,28 +617,23 @@ def create_live_point_in_time_backup(v, target):
         )
     )
 
-    # Clean up a stale concluded job if one somehow remains.
-    try:
-        jobs = qmp_cmd('query-jobs')
-        stale = next(
-            (item for item in jobs if item.get('id') == job_id),
-            None,
-        )
-
-        if stale:
-            status = stale.get('status')
-
-            if status == 'concluded':
-                qmp_cmd('job-dismiss', {'id': job_id})
-            else:
-                raise RuntimeError(
-                    f'cannot start checkpoint because QMP job '
-                    f'{job_id!r} already exists with status={status!r}'
-                )
-    except RuntimeError:
-        raise
-    except Exception as e:
-        log(f'stale QMP job check warning: {e}')
+    # A query failure is fatal: starting another backup without knowing the
+    # current job state could overlap jobs or overwrite a target.
+    jobs = qmp_cmd('query-jobs')
+    stale = next(
+        (item for item in jobs if item.get('id') == job_id),
+        None,
+    )
+    if stale:
+        status = stale.get('status')
+        if status == 'concluded':
+            qmp_cmd('job-dismiss', {'id': job_id})
+            log(f'dismissed stale concluded live backup job {job_id}')
+        else:
+            raise RuntimeError(
+                f'cannot start checkpoint because QMP job '
+                f'{job_id!r} already exists with status={status!r}'
+            )
 
     log(
         'starting QEMU point-in-time live backup '
@@ -485,8 +661,12 @@ def create_live_point_in_time_backup(v, target):
         if qemu_is_running():
             try:
                 qmp_cmd('job-cancel', {'id': job_id, 'force': True})
-            except Exception:
-                pass
+                log(f'cancel requested for failed live backup job {job_id}')
+            except Exception as cancel_error:
+                log(
+                    f'could not cancel failed live backup job {job_id}: '
+                    f'{cancel_error}'
+                )
 
             try:
                 jobs = qmp_cmd('query-jobs')
@@ -497,8 +677,11 @@ def create_live_point_in_time_backup(v, target):
 
                 if stale and stale.get('status') == 'concluded':
                     qmp_cmd('job-dismiss', {'id': job_id})
-            except Exception:
-                pass
+            except Exception as cleanup_error:
+                log(
+                    f'could not dismiss failed live backup job {job_id}: '
+                    f'{cleanup_error}'
+                )
 
         raise
 
@@ -512,205 +695,160 @@ def create_live_point_in_time_backup(v, target):
 
 
 def checkpoint(name='latest'):
-    v = cfg('vm.json')
-    s = cfg('storage.json')
-    c = cfg('checkpoint.json')
+    if name != 'latest':
+        raise SystemExit(
+            'only the latest checkpoint is supported; refusing to create '
+            f'a retained checkpoint named {name!r}'
+        )
 
-    overlay = ROOT / v['overlay_image']
-    comp = ROOT / v['overlay_compressed']
-    sha = WORK / 'overlay.sha256'
-    qmp_socket = ROOT / v['qmp_socket']
-    lock_path = WORK / 'checkpoint.lock'
-    live_backup = WORK / 'online-checkpoint-source.qcow2'
+    v=cfg('vm.json')
+    s=cfg('storage.json')
+    c=cfg('checkpoint.json')
+    overlay=ROOT/v['overlay_image']
+    base=ROOT/v['base_image']
+    comp=ROOT/v['overlay_compressed']
+    sha=WORK/'overlay.sha256'
+    manifest_path=WORK/'manifest.json'
+    qmp_socket=ROOT/v['qmp_socket']
+    lock_path=WORK/'checkpoint.lock'
+    live_backup=WORK/'online-checkpoint-full.qcow2'
+    live_overlay=WORK/'online-checkpoint-overlay.qcow2'
+    verify_download=WORK/'verify-download.zst.tmp'
 
     if not overlay.exists():
-        raise SystemExit('overlay missing')
+        raise SystemExit(f'overlay missing: {overlay}')
+    if not base.exists():
+        raise SystemExit(f'immutable base image missing: {base}')
 
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(lock_path, 'a+', encoding='utf-8') as lock_file:
+    lock_path.parent.mkdir(parents=True,exist_ok=True)
+    with open(lock_path,'a+',encoding='utf-8') as lock_file:
         log('waiting for checkpoint lock')
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        fcntl.flock(lock_file.fileno(),fcntl.LOCK_EX)
         log('checkpoint lock acquired')
 
-        checkpoint_mode = None
-        checkpoint_source = None
-
+        checkpoint_mode=None
+        checkpoint_source=None
         try:
-            running = qemu_is_running(v)
-            qmp_available = qmp_socket.exists()
+            running=qemu_is_running(v)
+            qmp_available=qmp_socket.exists()
 
             if running and qmp_available:
-                # Do not run qemu-img directly against a disk that the live
-                # QEMU process owns. QEMU keeps the image lock even while the
-                # VM is paused. Instead, ask QEMU itself to create a
-                # point-in-time full backup target.
+                # QEMU retains an exclusive QCOW2 lock even while paused.
+                # drive-backup is the safe point-in-time path while the guest
+                # owns the active overlay.
                 log(
-                    'QEMU is running; creating point-in-time live backup '
-                    'without opening the active disk with qemu-img'
+                    'QEMU is running; starting a point-in-time full QMP '
+                    'drive-backup without opening the active overlay'
                 )
+                create_live_point_in_time_backup(v,live_backup)
 
-                create_live_point_in_time_backup(v, live_backup)
-
-                # The backup job is finished and QEMU has released the target.
-                run(
-                    ['qemu-img', 'check', '-r', 'leaks', live_backup],
-                    check=False,
-                )
-
-                checkpoint_source = live_backup
-                checkpoint_mode = 'online-live-backup'
+                # QEMU has concluded and dismissed the job, so it no longer
+                # owns the separate full backup target. qemu-img may now check
+                # and convert that completed target safely.
+                run(['qemu-img','check',live_backup])
+                convert_to_backed_overlay(live_backup,base,live_overlay)
+                live_backup.unlink(missing_ok=True)
+                checkpoint_source=live_overlay
+                checkpoint_mode='online-live-backup'
 
             elif running:
                 raise RuntimeError(
                     'QEMU is running but the QMP socket is unavailable; '
-                    'refusing an unsafe direct copy of the active disk'
+                    'refusing an unsafe direct read of the active overlay'
                 )
 
             else:
+                # Missing qemu.pid and QMP socket are expected after a normal
+                # Windows shutdown. Never issue QMP commands on this path.
                 log(
-                    'QEMU is stopped; creating offline checkpoint from '
-                    'the inactive VM overlay'
+                    'QEMU is stopped; using the inactive overlay directly '
+                    'for the final offline checkpoint'
                 )
+                run(['qemu-img','check',overlay])
 
-                run(
-                    ['qemu-img', 'check', '-r', 'leaks', overlay],
-                    check=False,
-                )
-
-                compact = Path(str(overlay) + '.compact')
+                compact=Path(str(overlay)+'.compact.tmp')
                 compact.unlink(missing_ok=True)
+                required=converted_overlay_space_required(overlay)
+                available=shutil.disk_usage(overlay.parent).free
+                if available >= required:
+                    try:
+                        convert_to_backed_overlay(overlay,base,compact)
+                        compact.replace(overlay)
+                        log('offline overlay compacted successfully')
+                    finally:
+                        compact.unlink(missing_ok=True)
+                else:
+                    log(
+                        'offline compaction skipped because temporary disk '
+                        f'space is insufficient: required={required} '
+                        f'available={available} bytes'
+                    )
 
-                run([
-                    'qemu-img',
-                    'convert',
-                    '-p',
-                    '-O', 'qcow2',
-                    '-c',
-                    overlay,
-                    compact,
-                ])
+                checkpoint_source=overlay
+                checkpoint_mode='offline-stopped'
 
-                compact.replace(overlay)
-                log('offline overlay compacted')
-
-                checkpoint_source = overlay
-                checkpoint_mode = 'offline-stopped'
-
-            compress(checkpoint_source, comp)
-            digest = write_sha(comp, sha)
-
-            manifest = {
-                'version': 1,
-                'created_utc': datetime.datetime.now(
+            # Compression must finish completely before any upload starts.
+            compress(checkpoint_source,comp)
+            digest=write_sha(comp,sha)
+            manifest={
+                'version':2,
+                'created_utc':datetime.datetime.now(
                     datetime.timezone.utc
-                ).replace(
-                    microsecond=0
-                ).isoformat().replace('+00:00', 'Z'),
-                'name': name,
-                'sha256': digest,
-                'compressed': 'overlay.qcow2.zst',
-                'base_object': s['base_object'],
-                'checkpoint_mode': checkpoint_mode,
-                'checkpoint_interval_minutes': c.get(
-                    'interval_minutes',
-                    15,
-                ),
+                ).replace(microsecond=0).isoformat().replace('+00:00','Z'),
+                'name':'latest',
+                'sha256':digest,
+                'compressed':'overlay.qcow2.zst',
+                'base_object':s['base_object'],
+                'checkpoint_mode':checkpoint_mode,
+                'checkpoint_interval_minutes':c.get('interval_minutes',15),
+                'compression_level':c.get('compression_level',10),
+                'virtual_disk_size_bytes':qemu_virtual_size(checkpoint_source),
             }
-
-            (WORK / 'manifest.json').write_text(
-                json.dumps(manifest, indent=2),
-                encoding='utf-8',
+            atomic_write_text(
+                manifest_path,
+                json.dumps(manifest,indent=2)+'\n',
             )
 
-            if name == 'latest':
-                targets = [
-                    (s['latest_object'], comp),
-                    (s['latest_sha256_object'], sha),
-                    (s['manifest_object'], WORK / 'manifest.json'),
-                ]
-            else:
-                pref = f"{s['checkpoint_prefix'].strip('/')}/{name}"
-                targets = [
-                    (f'{pref}/overlay.qcow2.zst', comp),
-                    (f'{pref}/overlay.sha256', sha),
-                    (f'{pref}/manifest.json', WORK / 'manifest.json'),
-                ]
-
-            for obj, path in targets:
+            targets=[
+                (s['latest_object'],comp),
+                (s['latest_sha256_object'],sha),
+                (s['manifest_object'],manifest_path),
+            ]
+            for object_name,path in targets:
                 retry(
                     c['upload_retries'],
                     c['retry_initial_seconds'],
                     c['retry_max_seconds'],
                     aws_cp,
-                    str(path),
-                    s3_uri(obj),
+                    str(path),s3_uri(object_name),
                 )
 
-            tmp = WORK / 'verify-download.zst'
-            tmp.unlink(missing_ok=True)
-
+            verify_download.unlink(missing_ok=True)
             retry(
                 c['download_retries'],
                 c['retry_initial_seconds'],
                 c['retry_max_seconds'],
                 aws_cp,
-                s3_uri(targets[0][0]),
-                str(tmp),
+                s3_uri(s['latest_object']),str(verify_download),
             )
-
-            if sha256(tmp) != digest:
-                raise SystemExit('upload verification checksum mismatch')
+            verified_digest=sha256(verify_download)
+            if verified_digest != digest:
+                raise RuntimeError(
+                    'uploaded latest overlay verification failed: '
+                    f'expected={digest} actual={verified_digest}'
+                )
 
             log(
-                f'checkpoint uploaded and verified: {name} '
+                'checkpoint uploaded and verified: latest '
                 f'({checkpoint_mode})'
             )
-
         finally:
             live_backup.unlink(missing_ok=True)
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            live_overlay.unlink(missing_ok=True)
+            verify_download.unlink(missing_ok=True)
+            Path(str(comp)+'.tmp').unlink(missing_ok=True)
+            fcntl.flock(lock_file.fileno(),fcntl.LOCK_UN)
             log('checkpoint lock released')
-
-def rotate():
-    s = cfg('storage.json')
-    rotation_count = int(s.get('rotation_count', 0))
-
-    if rotation_count <= 0:
-        log(
-            'checkpoint rotation disabled; keeping only one latest overlay '
-            'plus the immutable base image'
-        )
-        return
-
-    for i in range(rotation_count, 0, -1):
-        src = (
-            'latest'
-            if i == 1
-            else f"{s['checkpoint_prefix'].strip('/')}/checkpoint{i-1}"
-        )
-        dst = f"{s['checkpoint_prefix'].strip('/')}/checkpoint{i}"
-
-        for filename in [
-            'overlay.qcow2.zst',
-            'overlay.sha256',
-            'manifest.json',
-        ]:
-            srcobj = (
-                s['latest_object']
-                if src == 'latest' and filename == 'overlay.qcow2.zst'
-                else s['latest_sha256_object']
-                if src == 'latest' and filename == 'overlay.sha256'
-                else s['manifest_object']
-                if src == 'latest'
-                else f'{src}/{filename}'
-            )
-
-            srcuri = s3_uri(srcobj)
-
-            if aws_ls(srcuri):
-                aws_cp(srcuri, s3_uri(f'{dst}/{filename}'))
-
 
 def prune_old_checkpoints():
     s = cfg('storage.json')
@@ -736,30 +874,124 @@ def prune_old_checkpoints():
     )
 
 
+def env_boolean(name, default=False):
+    value=os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    normalized=value.strip().lower()
+    if normalized in {'1','true','yes','on'}:
+        return True
+    if normalized in {'0','false','no','off'}:
+        return False
+    raise ValueError(
+        f'{name} must be true or false; got {value!r}'
+    )
+
+
+def download_object_atomic(object_name,destination,c):
+    destination=Path(destination)
+    destination.parent.mkdir(parents=True,exist_ok=True)
+    temporary=destination.with_name(destination.name+'.download.tmp')
+    temporary.unlink(missing_ok=True)
+    try:
+        retry(
+            c['download_retries'],
+            c['retry_initial_seconds'],
+            c['retry_max_seconds'],
+            aws_cp,
+            s3_uri(object_name),str(temporary),
+        )
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def restore():
-    v=cfg('vm.json'); s=cfg('storage.json'); c=cfg('checkpoint.json')
-    base=ROOT/v['base_image']; comp=ROOT/v['overlay_compressed']; overlay=ROOT/v['overlay_image']; sha=WORK/'overlay.sha256'
-    retry(c['download_retries'], c['retry_initial_seconds'], c['retry_max_seconds'], aws_cp, s3_uri(s['base_object']), str(base))
-    candidates=[('latest',s['latest_object'],s['latest_sha256_object'])]+[(f'checkpoint{i}',f"{s['checkpoint_prefix'].strip('/')}/checkpoint{i}/overlay.qcow2.zst",f"{s['checkpoint_prefix'].strip('/')}/checkpoint{i}/overlay.sha256") for i in range(1,s.get('rotation_count',3)+1)]
-    restored=False
-    for name,obj,shaobj in candidates:
-        if not aws_ls(s3_uri(obj)): continue
+    v=cfg('vm.json')
+    s=cfg('storage.json')
+    c=cfg('checkpoint.json')
+    base=ROOT/v['base_image']
+    comp=ROOT/v['overlay_compressed']
+    overlay=ROOT/v['overlay_image']
+    sha=WORK/'overlay.sha256'
+    allow_fresh=env_boolean('ALLOW_FRESH_OVERLAY_IF_MISSING',False)
+
+    for path in [overlay,Path(str(overlay)+'.tmp')]:
+        path.unlink(missing_ok=True)
+
+    log(f'downloading immutable base image: {s3_uri(s["base_object"])}')
+    download_object_atomic(s['base_object'],base,c)
+    base_info=qemu_image_info(base)
+    if base_info.get('format') != 'qcow2':
+        raise RuntimeError(
+            f'base image is not QCOW2: format={base_info.get("format")!r}'
+        )
+    run(['qemu-img','check',base])
+    log('immutable base image downloaded and validated')
+
+    try:
+        # This is deliberately a direct download. Do not precede it with a
+        # quiet `aws s3 ls` probe: access and provider errors must be visible.
         try:
-            retry(c['download_retries'], c['retry_initial_seconds'], c['retry_max_seconds'], aws_cp, s3_uri(obj), str(comp))
-            retry(c['download_retries'], c['retry_initial_seconds'], c['retry_max_seconds'], aws_cp, s3_uri(shaobj), str(sha))
-            verify_sha(comp, sha); decompress(comp, overlay); restored=True; log(f'restored overlay from {name}'); break
-        except Exception as e: log(f'restore candidate failed {name}: {e}')
-    if not restored: create_overlay(base, overlay)
+            download_object_atomic(s['latest_object'],comp,c)
+        except Exception as error:
+            log(
+                'latest overlay direct download failed; the complete AWS CLI '
+                f'provider error is printed above: {error}'
+            )
+            raise
+
+        log('overlay archive downloaded successfully from latest')
+        download_object_atomic(s['latest_sha256_object'],sha,c)
+        verify_sha(comp,sha)
+        decompress(comp,overlay)
+        normalize_overlay_backing(overlay,base)
+        run(['qemu-img','check',overlay])
+        log('restored overlay from latest')
+    except Exception as error:
+        overlay.unlink(missing_ok=True)
+        Path(str(overlay)+'.tmp').unlink(missing_ok=True)
+        if not allow_fresh:
+            raise RuntimeError(
+                'latest persistent overlay is missing, inaccessible, corrupt, '
+                'or could not be decompressed; refusing to create a blank '
+                'overlay because allow_fresh_overlay_if_missing=false'
+            ) from error
+
+        log(
+            'WARNING: latest overlay restore failed and '
+            'allow_fresh_overlay_if_missing=true; creating an explicitly '
+            f'authorized blank overlay. Restore error: {error}'
+        )
+        create_overlay(base,overlay)
+        run(['qemu-img','check',overlay])
+        log('fresh overlay created by explicit workflow authorization')
+    finally:
+        # The verified/decompressed archive is not needed locally. Removing it
+        # frees space for the next atomic compression output.
+        comp.unlink(missing_ok=True)
+        Path(str(comp)+'.download.tmp').unlink(missing_ok=True)
 def retry(maxn,delay,cap,func,*args):
     n=1
     while True:
-        try: return func(*args)
-        except Exception:
-            if n>=maxn: raise
-            time.sleep(delay); n+=1; delay=min(delay*2,cap)
+        try:
+            return func(*args)
+        except Exception as error:
+            if n>=maxn:
+                log(
+                    f'operation failed after {maxn} attempt(s): {error}'
+                )
+                raise
+            log(
+                f'operation attempt {n}/{maxn} failed: {error}; '
+                f'retrying in {delay}s'
+            )
+            time.sleep(delay)
+            n+=1
+            delay=min(delay*2,cap)
 def main():
     p=argparse.ArgumentParser(); sub=p.add_subparsers(dest='cmd', required=True)
-    for x in ['boot','restore','shutdown','rotate','prune-old-checkpoints']: sub.add_parser(x)
+    for x in ['boot','restore','shutdown','prune-old-checkpoints']: sub.add_parser(x)
     a=sub.add_parser('wait-rdp'); a.add_argument('--timeout',type=int,default=900)
     a=sub.add_parser('checkpoint'); a.add_argument('--name',default='latest')
     a=sub.add_parser('sha256'); a.add_argument('path'); a.add_argument('out')
@@ -772,17 +1004,15 @@ def main():
         'boot': boot,
         'restore': restore,
         'shutdown': shutdown,
-        'rotate': rotate,
         'prune-old-checkpoints': prune_old_checkpoints,
     }.get(ns.cmd, lambda: None)() if ns.cmd in [
         'boot',
         'restore',
         'shutdown',
-        'rotate',
         'prune-old-checkpoints',
     ] else None
     if ns.cmd=='wait-rdp': wait_rdp(ns.timeout)
-    elif ns.cmd=='checkpoint': rotate(); checkpoint(ns.name)
+    elif ns.cmd=='checkpoint': checkpoint(ns.name)
     elif ns.cmd=='sha256': write_sha(ns.path, ns.out)
     elif ns.cmd=='verify-sha': verify_sha(ns.path, ns.sha)
     elif ns.cmd=='create-overlay': create_overlay(ns.base, ns.overlay)

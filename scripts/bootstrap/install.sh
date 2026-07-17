@@ -20,6 +20,8 @@ sudo apt-get install -y \
     qemu-system-x86 \
     qemu-utils \
     ovmf \
+    python3-pytest \
+    python3-yaml \
     socat \
     netcat-openbsd \
     genisoimage
