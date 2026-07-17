@@ -336,10 +336,13 @@ def require_temporary_space(directory, required_bytes, operation):
 def converted_overlay_space_required(source):
     info=qemu_image_info(source)
     actual_size=int(info.get('actual-size') or Path(source).stat().st_size)
-    # Leave room for QCOW2 metadata growth while converting. The output is
-    # sparse and backed by the immutable base, so changed allocated clusters
-    # are the main space requirement.
-    return max(actual_size + 1024**3, 2 * 1024**3)
+    # Leave 512 MiB for QCOW2 metadata growth. For the supported 80+ GiB
+    # virtual disks this is deliberately much larger than the L1/L2 and
+    # refcount metadata, without rejecting a viable conversion on the tight
+    # GitHub-hosted filesystem. qemu-img still fails closed and the partial
+    # destination is deleted if actual allocation exceeds available space.
+    metadata_reserve=512 * 1024**2
+    return max(actual_size + metadata_reserve, 2 * 1024**3)
 
 
 def convert_to_backed_overlay(source, base, destination):

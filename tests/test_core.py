@@ -136,6 +136,24 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(convert[convert.index('-F')+1],'qcow2')
             self.assertTrue(destination.exists())
 
+    def test_conversion_space_reserve_fits_tight_hosted_runner_capacity(self):
+        source=Path('full.qcow2')
+        actual_size=31_251_705_856
+        with mock.patch.object(
+            libvm,'qemu_image_info',return_value={'actual-size':actual_size}
+        ):
+            required=libvm.converted_overlay_space_required(source)
+        self.assertEqual(required,actual_size + 512 * 1024**2)
+        self.assertLessEqual(required,32_288_804_864)
+
+        with mock.patch.object(
+            libvm,'qemu_image_info',return_value={'actual-size':1}
+        ):
+            self.assertEqual(
+                libvm.converted_overlay_space_required(source),
+                2 * 1024**3,
+            )
+
     def test_qmp_backup_job_errors_are_detected_and_dismissed(self):
         calls=[]
 
