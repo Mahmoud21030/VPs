@@ -84,9 +84,13 @@ VNC: <TAILSCALE_IP>:5900
 
 VNC remains active even when RDP works.
 
+QEMU binds both forwarded ports directly to the runner's Tailscale IPv4 address rather than every host interface. Workflow inputs are passed through environment variables instead of being interpolated into shell programs, and third-party Actions are pinned to immutable commit SHAs.
+
 ## Restore safety
 
 Restore always downloads `base.qcow2`, directly downloads `latest/overlay.qcow2.zst`, downloads the SHA256 sidecar, verifies it, and only then decompresses and checks the overlay. It does not use a quiet `aws s3 ls` existence probe.
+
+The manifest is also validated. Version 3 manifests bind the overlay to the SHA256 of the immutable base, preventing a checkpoint from booting against a silently replaced or incompatible base image. Existing version 2 manifests are accepted for migration and upgraded by the next verified checkpoint.
 
 AWS object transfers disable the CLI's carriage-return progress renderer because GitHub Actions expands every refresh into a separate log line. Storage errors remain fully visible, and each successful transfer prints one timestamped completion line.
 

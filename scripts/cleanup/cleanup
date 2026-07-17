@@ -8,11 +8,8 @@ log "cleanup started"
 
 if [[ -f "$WORK_DIR/final-checkpoint.done" ]]; then
     log "verified final latest checkpoint was already completed"
-    if [[ -f "$WORK_DIR/qemu.pid" ]]; then
-        QEMU_PID="$(cat "$WORK_DIR/qemu.pid")"
-        if kill -0 "$QEMU_PID" 2>/dev/null; then
-            "$ROOT_DIR/scripts/qemu/shutdown"
-        fi
+    if qemu_is_running; then
+        "$ROOT_DIR/scripts/qemu/shutdown"
     fi
     exit 0
 fi
@@ -29,9 +26,6 @@ python3 "$ROOT_DIR/scripts/libvm.py" checkpoint --name latest
 touch "$WORK_DIR/final-checkpoint.done"
 log "final latest checkpoint completed successfully"
 
-if [[ -f "$WORK_DIR/qemu.pid" ]]; then
-    QEMU_PID="$(cat "$WORK_DIR/qemu.pid")"
-    if kill -0 "$QEMU_PID" 2>/dev/null; then
-        "$ROOT_DIR/scripts/qemu/shutdown"
-    fi
+if qemu_is_running; then
+    "$ROOT_DIR/scripts/qemu/shutdown"
 fi

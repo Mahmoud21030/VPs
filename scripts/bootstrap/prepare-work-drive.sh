@@ -69,7 +69,7 @@ if [[ -L "$WORK_LINK" ]]; then
     rm -f "$WORK_LINK"
 elif [[ -e "$WORK_LINK" ]]; then
     if [[ -d "$WORK_LINK" ]]; then
-        cp -a "$WORK_LINK/." "$vm_work_dir/" 2>/dev/null || true
+        cp -a "$WORK_LINK/." "$vm_work_dir/"
     fi
     rm -rf "$WORK_LINK"
 fi

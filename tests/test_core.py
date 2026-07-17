@@ -15,6 +15,7 @@ import yaml
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'scripts'))
 import libvm
+import libbase
 
 
 class CoreTests(unittest.TestCase):
@@ -163,6 +164,58 @@ class CoreTests(unittest.TestCase):
             ('job-dismiss',{'id':'persistent-checkpoint-backup'}),calls
         )
 
+    def test_qemu_process_identity_rejects_stale_pid_reuse(self):
+        vm={'pid_file':'work/qemu.pid','overlay_image':'work/overlay.qcow2'}
+        with mock.patch.object(libvm,'qemu_pid',return_value=4242), mock.patch.object(
+            libvm.os,'kill'
+        ), mock.patch.object(
+            libvm,'process_cmdline',return_value=b'/usr/bin/sleep\x001000\x00'
+        ):
+            self.assertFalse(libvm.qemu_is_running(vm))
+
+        expected=str(libvm.ROOT/'work/overlay.qcow2').encode()
+        with mock.patch.object(libvm,'qemu_pid',return_value=4242), mock.patch.object(
+            libvm.os,'kill'
+        ), mock.patch.object(
+            libvm,
+            'process_cmdline',
+            return_value=b'/usr/bin/qemu-system-x86_64\x00-drive\x00file='+expected+b'\x00',
+        ):
+            self.assertTrue(libvm.qemu_is_running(vm))
+
+    def test_checkpoint_refuses_ambiguous_qmp_socket_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            work=root/'work'
+            work.mkdir()
+            (work/'base.qcow2').write_bytes(b'base')
+            (work/'overlay.qcow2').write_bytes(b'overlay')
+            (work/'qmp.sock').touch()
+            vm={
+                'base_image':'work/base.qcow2',
+                'overlay_image':'work/overlay.qcow2',
+                'overlay_compressed':'work/overlay.qcow2.zst',
+                'qmp_socket':'work/qmp.sock',
+                'pid_file':'work/qemu.pid',
+            }
+            storage={}
+            checkpoint={}
+
+            def fake_cfg(name):
+                return {
+                    'vm.json':vm,
+                    'storage.json':storage,
+                    'checkpoint.json':checkpoint,
+                }[name]
+
+            with mock.patch.object(libvm,'ROOT',root), mock.patch.object(
+                libvm,'WORK',work
+            ), mock.patch.object(libvm,'cfg',side_effect=fake_cfg), mock.patch.object(
+                libvm,'qemu_is_running',return_value=False
+            ), mock.patch.object(libvm,'log'):
+                with self.assertRaisesRegex(RuntimeError,'process identity'):
+                    libvm.checkpoint()
+
     def _restore_fixture(self,root,allow_fresh):
         work=root/'work'
         work.mkdir()
@@ -175,6 +228,7 @@ class CoreTests(unittest.TestCase):
             'base_object':'base.qcow2',
             'latest_object':'latest/overlay.qcow2.zst',
             'latest_sha256_object':'latest/overlay.sha256',
+            'manifest_object':'latest/manifest.json',
         }
         checkpoint={
             'download_retries':1,
@@ -293,6 +347,58 @@ class CoreTests(unittest.TestCase):
         self.assertIn('--no-progress',captured[0])
         self.assertEqual(captured[0][-2:],['--copy-props','none'])
 
+    def test_storage_endpoints_require_https_without_embedded_credentials(self):
+        self.assertEqual(
+            libvm.validate_storage_endpoint('https://storage.example'),
+            'https://storage.example',
+        )
+        for endpoint in (
+            'http://storage.example',
+            'https://user:secret@storage.example',
+            'https://storage.example?token=secret',
+        ):
+            with self.assertRaises(RuntimeError):
+                libvm.validate_storage_endpoint(endpoint)
+
+    def test_vm_listeners_require_a_tailscale_ipv4_address(self):
+        self.assertEqual(
+            libvm.validate_tailscale_bind_address('100.100.10.20'),
+            '100.100.10.20',
+        )
+        for address in ('0.0.0.0','127.0.0.1','192.168.1.10','not-an-ip'):
+            with self.assertRaises(RuntimeError):
+                libvm.validate_tailscale_bind_address(address)
+
+    def test_base_download_urls_are_https_and_redacted(self):
+        self.assertEqual(
+            libbase.safe_download_url('https://example.test/windows.iso?signature=secret'),
+            'https://example.test/windows.iso',
+        )
+        with self.assertRaises(ValueError):
+            libbase.safe_download_url('http://example.test/windows.iso')
+
+    def test_manifest_binds_archive_and_immutable_base(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path=Path(directory)/'manifest.json'
+            archive_digest='a'*64
+            base_digest='b'*64
+            manifest_path.write_text(json.dumps({
+                'version':3,
+                'name':'latest',
+                'sha256':archive_digest,
+                'compressed':'overlay.qcow2.zst',
+                'base_object':'base.qcow2',
+                'base_sha256':base_digest,
+            }))
+            parsed=libvm.validate_checkpoint_manifest(
+                manifest_path,archive_digest,base_digest,{'base_object':'base.qcow2'}
+            )
+            self.assertEqual(parsed['version'],3)
+            with self.assertRaisesRegex(RuntimeError,'base SHA256'):
+                libvm.validate_checkpoint_manifest(
+                    manifest_path,archive_digest,'c'*64,{'base_object':'base.qcow2'}
+                )
+
     def test_all_workflow_yaml_parses(self):
         workflows=sorted((ROOT/'.github'/'workflows').glob('*.yml'))
         self.assertTrue(workflows)
@@ -304,6 +410,20 @@ class CoreTests(unittest.TestCase):
             self.assertIsInstance(parsed,dict,workflow)
             self.assertIn('on',parsed,workflow)
             self.assertIn('jobs',parsed,workflow)
+            self.assertEqual(parsed.get('permissions',{}).get('contents'),'read')
+            for job in parsed['jobs'].values():
+                for step in job.get('steps',[]):
+                    action=step.get('uses')
+                    if action:
+                        self.assertRegex(action,r'^[^@]+@[0-9a-f]{40}$')
+                    command=step.get('run','')
+                    self.assertNotIn('${{ inputs.',command)
+
+        dependabot=yaml.load(
+            (ROOT/'.github'/'dependabot.yml').read_text(encoding='utf-8'),
+            Loader=yaml.BaseLoader,
+        )
+        self.assertEqual(dependabot.get('version'),'2')
 
 
 if __name__ == '__main__':

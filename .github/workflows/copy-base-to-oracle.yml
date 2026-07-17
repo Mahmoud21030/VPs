@@ -9,8 +9,11 @@ on:
         default: windows-vm
         type: string
 
+permissions:
+  contents: read
+
 concurrency:
-  group: copy-base-image-to-oracle
+  group: windows-vm-storage
   cancel-in-progress: false
 
 jobs:
@@ -50,7 +53,7 @@ jobs:
           df -B1 -P
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Use largest writable filesystem for base staging
         run: scripts/bootstrap/prepare-work-drive.sh
@@ -73,13 +76,15 @@ jobs:
               exit 1
             fi
           done
-          if [[ "$OBJECT_PREFIX" == /* || "$OBJECT_PREFIX" == *".."* ]]; then
-            echo "::error::object_prefix must be a safe relative object prefix"
+          if [[ ! "$OBJECT_PREFIX" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ||
+                "$OBJECT_PREFIX" == /* || "$OBJECT_PREFIX" == *".."* ||
+                "$OBJECT_PREFIX" == *"//"* || "$OBJECT_PREFIX" == */ ]]; then
+            echo "::error::object_prefix must be a normalized safe relative object prefix"
             exit 1
           fi
           case "$B2_ENDPOINT" in
-            http://*|https://*) ;;
-            *) echo "::error::B2_ENDPOINT must start with http:// or https://"; exit 1 ;;
+            https://*) ;;
+            *) echo "::error::B2_ENDPOINT must be an absolute HTTPS URL"; exit 1 ;;
           esac
           B2_RESOLVED_REGION="$B2_REGION"
           if [[ -z "$B2_RESOLVED_REGION" ]]; then
@@ -98,9 +103,14 @@ jobs:
             ORACLE_ENDPOINT="https://${ORACLE_NAMESPACE}.compat.objectstorage.${ORACLE_REGION}.oci.customer-oci.com"
           fi
           case "$ORACLE_ENDPOINT" in
-            http://*|https://*) ;;
-            *) echo "::error::ORACLE_ENDPOINT must start with http:// or https://"; exit 1 ;;
+            https://*) ;;
+            *) echo "::error::ORACLE_ENDPOINT must be an absolute HTTPS URL"; exit 1 ;;
           esac
+          if [[ "$B2_ENDPOINT" == *"@"* || "$B2_ENDPOINT" == *"?"* || "$B2_ENDPOINT" == *"#"* ||
+                "$ORACLE_ENDPOINT" == *"@"* || "$ORACLE_ENDPOINT" == *"?"* || "$ORACLE_ENDPOINT" == *"#"* ]]; then
+            echo "::error::Storage endpoints must not contain credentials, queries, or fragments"
+            exit 1
+          fi
           echo "ORACLE_ENDPOINT=$ORACLE_ENDPOINT" >> "$GITHUB_ENV"
 
           mkdir -p "$RUNNER_TEMP/aws"
@@ -158,7 +168,8 @@ jobs:
 
           retry 5 b2_aws s3 cp \
             "s3://${B2_BUCKET}/${OBJECT_PREFIX}/base.qcow2" \
-            "$base_tmp"
+            "$base_tmp" \
+            --no-progress
           mv "$base_tmp" "$base"
           qemu-img check "$base"
           source_sha="$(sha256sum "$base" | awk '{print $1}')"
@@ -166,11 +177,13 @@ jobs:
 
           retry 5 oracle_aws s3 cp \
             "$base" \
-            "s3://${ORACLE_BUCKET}/${OBJECT_PREFIX}/base.qcow2"
+            "s3://${ORACLE_BUCKET}/${OBJECT_PREFIX}/base.qcow2" \
+            --no-progress
 
           retry 5 oracle_aws s3 cp \
             "s3://${ORACLE_BUCKET}/${OBJECT_PREFIX}/base.qcow2" \
-            "$verify"
+            "$verify" \
+            --no-progress
           oracle_sha="$(sha256sum "$verify" | awk '{print $1}')"
           echo "Oracle base SHA256:    $oracle_sha"
           if [[ "$source_sha" != "$oracle_sha" ]]; then

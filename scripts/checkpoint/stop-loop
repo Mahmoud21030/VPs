@@ -18,7 +18,7 @@ if [[ ! "$loop_pid" =~ ^[0-9]+$ ]]; then
 fi
 
 log "waiting for checkpoint loop PID $loop_pid to stop cleanly"
-while [[ -f "$pid_file" ]] && kill -0 "$loop_pid" 2>/dev/null; do
+while [[ -f "$pid_file" ]] && pid_matches_command "$loop_pid" "$ROOT_DIR/scripts/checkpoint/loop"; do
   sleep 2
 done
 rm -f "$pid_file"

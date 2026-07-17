@@ -42,9 +42,13 @@ case "$provider" in
 esac
 
 case "$endpoint" in
-  http://*|https://*) ;;
-  *) echo "Storage endpoint must include https:// or http://: $endpoint" >&2; exit 2 ;;
+  https://*) ;;
+  *) echo "Storage endpoint must be an absolute HTTPS URL: $endpoint" >&2; exit 2 ;;
 esac
+if [[ "$endpoint" == *"@"* || "$endpoint" == *"?"* || "$endpoint" == *"#"* ]]; then
+  echo "Storage endpoint must not contain credentials, a query, or a fragment" >&2
+  exit 2
+fi
 
 export AWS_ACCESS_KEY_ID="$access_key"
 export AWS_SECRET_ACCESS_KEY="$secret_key"

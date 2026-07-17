@@ -7,9 +7,10 @@ Recovery is intentionally fail-closed:
 3. Log `overlay archive downloaded successfully from latest`.
 4. Download `windows-vm/latest/overlay.sha256`.
 5. Verify the archive SHA256.
-6. Decompress atomically and validate the QCOW2 overlay.
-7. Log `restored overlay from latest`.
-8. Allow the workflow to boot QEMU.
+6. Download and validate `windows-vm/latest/manifest.json`, including the immutable base SHA256 for manifest version 3.
+7. Decompress atomically and validate the QCOW2 overlay and virtual size.
+8. Log `restored overlay from latest`.
+9. Allow the workflow to boot QEMU.
 
 There is no silent listing probe and no rollback to `checkpoint1`, `checkpoint2`, or `checkpoint3`. Restore fails when latest is missing, inaccessible, corrupt, or cannot be decompressed.
 

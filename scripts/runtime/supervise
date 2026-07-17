@@ -18,8 +18,7 @@ deadline=$((start_epoch + forced_minutes * 60))
 log "runtime supervisor started; forced final save deadline=$(date -u -d "@$deadline" +%Y-%m-%dT%H:%M:%SZ)"
 
 while true; do
-  qemu_pid="$(cat "$WORK_DIR/qemu.pid" 2>/dev/null || true)"
-  if [[ -z "$qemu_pid" ]] || ! kill -0 "$qemu_pid" 2>/dev/null; then
+  if ! qemu_is_running; then
     log "QEMU exited after normal Windows shutdown"
     "$ROOT_DIR/scripts/checkpoint/stop-loop"
     "$ROOT_DIR/scripts/checkpoint/checkpoint" latest
@@ -28,7 +27,8 @@ while true; do
     exit 0
   fi
 
-  if [[ ! -f "$WORK_DIR/checkpoint-loop.pid" ]]; then
+  loop_pid="$(cat "$WORK_DIR/checkpoint-loop.pid" 2>/dev/null || true)"
+  if ! pid_matches_command "$loop_pid" "$ROOT_DIR/scripts/checkpoint/loop"; then
     echo "automatic checkpoint loop exited unexpectedly" >&2
     exit 1
   fi

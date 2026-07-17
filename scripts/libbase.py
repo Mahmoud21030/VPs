@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -12,6 +13,7 @@ import shutil
 import subprocess
 import time
 import urllib.request
+import urllib.parse
 from pathlib import Path
 from typing import Callable, TypeVar
 
@@ -97,8 +99,18 @@ def storage_context() -> dict[str, str]:
             host = endpoint.split("://", 1)[-1].split("/", 1)[0]
             region = host[3:].split(".backblazeb2.com", 1)[0] if host.startswith("s3.") and ".backblazeb2.com" in host else spec.get("default_region", "us-east-1")
 
-    if not endpoint.startswith(("https://", "http://")):
-        raise RuntimeError(f"storage endpoint must include http:// or https://: {endpoint}")
+    parsed_endpoint = urllib.parse.urlsplit(endpoint)
+    if parsed_endpoint.scheme.lower() != "https" or not parsed_endpoint.hostname:
+        raise RuntimeError(f"storage endpoint must be an absolute HTTPS URL: {endpoint}")
+    if (
+        parsed_endpoint.username
+        or parsed_endpoint.password
+        or parsed_endpoint.query
+        or parsed_endpoint.fragment
+    ):
+        raise RuntimeError(
+            "storage endpoint must not contain credentials, a query, or a fragment"
+        )
 
     return {
         "provider": provider,
@@ -167,13 +179,53 @@ def s3_uri(object_name: str) -> str:
 
 
 def aws_cp(source: str, destination: str) -> subprocess.CompletedProcess[str]:
-    return run(
-        ["aws", "--endpoint-url", endpoint(), "s3", "cp", source, destination],
+    result = run(
+        [
+            "aws", "--endpoint-url", endpoint(), "s3", "cp",
+            source, destination, "--no-progress",
+        ],
         env=aws_env(),
     )
+    log(f"object transfer completed: {source} -> {destination}")
+    return result
+
+
+def safe_download_url(url: str) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        raise ValueError("download URL must be an absolute HTTPS URL")
+    if parsed.username or parsed.password:
+        raise ValueError("download URL must not contain embedded credentials")
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+
+def tailscale_bind_address() -> str:
+    value = os.environ.get("VM_BIND_ADDRESS", "").strip()
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError as error:
+        raise RuntimeError(f"invalid VM bind address: {value!r}") from error
+    if address.version != 4 or address not in ipaddress.ip_network("100.64.0.0/10"):
+        raise RuntimeError(f"VM bind address must be a Tailscale IPv4 address: {value}")
+    return str(address)
+
+
+def atomic_write_text(path: str | Path, content: str) -> None:
+    destination = Path(path)
+    temporary = destination.with_name(destination.name + ".tmp")
+    temporary.unlink(missing_ok=True)
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def download(url: str, destination: str | Path) -> None:
+    display_url = safe_download_url(url)
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
 
@@ -183,12 +235,16 @@ def download(url: str, destination: str | Path) -> None:
 
     temporary = destination.with_suffix(destination.suffix + ".tmp")
     temporary.unlink(missing_ok=True)
-    log(f"downloading {url}")
+    log(f"downloading {display_url}")
 
     request = urllib.request.Request(url, headers={"User-Agent": "persistent-windows-github-vm/1"})
     try:
         with urllib.request.urlopen(request, timeout=60) as response, temporary.open("wb") as output:
             shutil.copyfileobj(response, output, 1024 * 1024)
+            output.flush()
+            os.fsync(output.fileno())
+        if temporary.stat().st_size == 0:
+            raise RuntimeError(f"download produced an empty file: {display_url}")
         temporary.replace(destination)
     finally:
         temporary.unlink(missing_ok=True)
@@ -225,12 +281,29 @@ def wait_for_poweroff(pidfile: str | Path, timeout_seconds: int) -> None:
 def build(args: argparse.Namespace) -> None:
     vm = cfg("vm.json")
     checkpoint = cfg("checkpoint.json")
+    bind_address = tailscale_bind_address()
 
     requested_disk_bytes = parse_qemu_size(args.disk_size)
     if requested_disk_bytes < 81 * (1024 ** 3):
         raise SystemExit(
             f"disk size must be above 80G; received {args.disk_size}"
         )
+
+    if not 2048 <= args.memory_mb <= 65536:
+        raise SystemExit("memory_mb must be from 2048 through 65536")
+    if not 1 <= args.cpu_cores <= 16:
+        raise SystemExit("cpu_cores must be from 1 through 16")
+    if not 15 <= args.install_timeout_minutes <= 225:
+        raise SystemExit("install_timeout_minutes must be from 15 through 225")
+
+    safe_download_url(args.windows_iso_url)
+    safe_download_url(args.virtio_iso_url)
+    for label, digest in (
+        ("windows_iso_sha256", args.windows_iso_sha256),
+        ("virtio_iso_sha256", args.virtio_iso_sha256),
+    ):
+        if digest and not re.fullmatch(r"[0-9A-Fa-f]{64}", digest):
+            raise SystemExit(f"{label} must be exactly 64 hexadecimal characters")
 
     log(f"requested Windows virtual disk size: {args.disk_size}")
 
@@ -307,7 +380,7 @@ def build(args: argparse.Namespace) -> None:
         "-qmp", f"unix:{qmp_socket},server=on,wait=off",
         "-pidfile", pidfile,
         "-daemonize",
-        "-vnc", "0.0.0.0:0",
+        "-vnc", f"{bind_address}:0",
         "-serial", f"file:{ROOT / vm['monitor_log']}",
     ]
 
@@ -325,8 +398,9 @@ def build(args: argparse.Namespace) -> None:
     compacted.replace(base)
 
     digest = sha256(base)
-    (WORK / "base.sha256").write_text(f"{digest} {base.name}\n", encoding="utf-8")
-    (WORK / "base-manifest.json").write_text(
+    atomic_write_text(WORK / "base.sha256", f"{digest} {base.name}\n")
+    atomic_write_text(
+        WORK / "base-manifest.json",
         json.dumps(
             {
                 "version": 1,
@@ -338,7 +412,6 @@ def build(args: argparse.Namespace) -> None:
             },
             indent=2,
         ) + "\n",
-        encoding="utf-8",
     )
     log(f"base image ready: {base} sha256={digest}")
 
@@ -356,10 +429,11 @@ def upload(_: argparse.Namespace) -> None:
         raise SystemExit(f"missing base image: {base}")
 
     digest = sha256(base)
-    checksum_file.write_text(f"{digest} {base.name}\n", encoding="utf-8")
+    atomic_write_text(checksum_file, f"{digest} {base.name}\n")
 
     if not manifest.exists():
-        manifest.write_text(
+        atomic_write_text(
+            manifest,
             json.dumps(
                 {
                     "version": 1,
@@ -370,7 +444,6 @@ def upload(_: argparse.Namespace) -> None:
                 },
                 indent=2,
             ) + "\n",
-            encoding="utf-8",
         )
 
     # Object storage intentionally retains only one immutable base object.

@@ -58,8 +58,11 @@ on:
         default: ""
         type: string
 
+permissions:
+  contents: read
+
 concurrency:
-  group: windows-vm-base-image
+  group: windows-vm-storage
   cancel-in-progress: false
 
 jobs:
@@ -135,7 +138,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Use largest writable filesystem for VM files
         shell: bash
@@ -187,7 +190,7 @@ jobs:
         run: scripts/storage/login
 
       - name: Connect runner to Tailscale
-        uses: tailscale/github-action@v4
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
@@ -206,13 +209,37 @@ jobs:
           fi
 
           echo "tailscale_ip=$TS_IP" >> "$GITHUB_OUTPUT"
+          echo "VM_BIND_ADDRESS=$TS_IP" >> "$GITHUB_ENV"
           echo "VNC address will be: ${TS_IP}:5900"
           tailscale status
 
       - name: Build Windows base image with interactive VNC console
         shell: bash
+        env:
+          WINDOWS_ISO_URL: ${{ inputs.windows_iso_url }}
+          VIRTIO_ISO_URL: ${{ inputs.virtio_iso_url }}
+          WINDOWS_ISO_SHA256: ${{ inputs.windows_iso_sha256 }}
+          VIRTIO_ISO_SHA256: ${{ inputs.virtio_iso_sha256 }}
+          DISK_SIZE: ${{ inputs.disk_size }}
+          MEMORY_MB: ${{ inputs.memory_mb }}
+          CPU_CORES: ${{ inputs.cpu_cores }}
+          INSTALL_TIMEOUT_MINUTES: ${{ inputs.install_timeout_minutes }}
+          VM_BIND_ADDRESS: ${{ steps.vnc.outputs.tailscale_ip }}
         run: |
           set -Eeuo pipefail
+
+          if [[ ! "$MEMORY_MB" =~ ^[0-9]+$ ]] || (( MEMORY_MB < 2048 || MEMORY_MB > 65536 )); then
+            echo "::error::memory_mb must be an integer from 2048 through 65536"
+            exit 1
+          fi
+          if [[ ! "$CPU_CORES" =~ ^[0-9]+$ ]] || (( CPU_CORES < 1 || CPU_CORES > 16 )); then
+            echo "::error::cpu_cores must be an integer from 1 through 16"
+            exit 1
+          fi
+          if [[ ! "$INSTALL_TIMEOUT_MINUTES" =~ ^[0-9]+$ ]] || (( INSTALL_TIMEOUT_MINUTES < 15 || INSTALL_TIMEOUT_MINUTES > 225 )); then
+            echo "::error::install_timeout_minutes must be an integer from 15 through 225"
+            exit 1
+          fi
 
           echo "Storage provider: $STORAGE_PROVIDER"
           echo "Starting QEMU base-image builder"
@@ -220,14 +247,14 @@ jobs:
           echo "Install Windows manually, then shut Windows down normally."
 
           scripts/qemu/build-base \
-            --windows-iso-url "${{ inputs.windows_iso_url }}" \
-            --virtio-iso-url "${{ inputs.virtio_iso_url }}" \
-            --windows-iso-sha256 "${{ inputs.windows_iso_sha256 }}" \
-            --virtio-iso-sha256 "${{ inputs.virtio_iso_sha256 }}" \
-            --disk-size "${{ inputs.disk_size }}" \
-            --memory-mb "${{ inputs.memory_mb }}" \
-            --cpu-cores "${{ inputs.cpu_cores }}" \
-            --install-timeout-minutes "${{ inputs.install_timeout_minutes }}" &
+            --windows-iso-url "$WINDOWS_ISO_URL" \
+            --virtio-iso-url "$VIRTIO_ISO_URL" \
+            --windows-iso-sha256 "$WINDOWS_ISO_SHA256" \
+            --virtio-iso-sha256 "$VIRTIO_ISO_SHA256" \
+            --disk-size "$DISK_SIZE" \
+            --memory-mb "$MEMORY_MB" \
+            --cpu-cores "$CPU_CORES" \
+            --install-timeout-minutes "$INSTALL_TIMEOUT_MINUTES" &
 
           BUILD_PID=$!
 
@@ -264,7 +291,7 @@ jobs:
 
       - name: Upload build logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: base-image-logs
           if-no-files-found: ignore

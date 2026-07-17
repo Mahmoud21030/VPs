@@ -57,8 +57,11 @@ on:
         default: ""
         type: string
 
+permissions:
+  contents: read
+
 concurrency:
-  group: windows-vm-runtime
+  group: windows-vm-storage
   cancel-in-progress: false
 
 jobs:
@@ -111,7 +114,7 @@ jobs:
           df -B1 -P
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Use largest writable filesystem for physical VM files
         shell: bash
@@ -129,12 +132,12 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          if [[ ! "$MEMORY_MB" =~ ^[0-9]+$ ]] || (( MEMORY_MB < 1024 )); then
-            echo "::error::memory_mb must be an integer of at least 1024"
+          if [[ ! "$MEMORY_MB" =~ ^[0-9]+$ ]] || (( MEMORY_MB < 2048 || MEMORY_MB > 65536 )); then
+            echo "::error::memory_mb must be an integer from 2048 through 65536"
             exit 1
           fi
-          if [[ ! "$CPU_CORES" =~ ^[0-9]+$ ]] || (( CPU_CORES < 1 )); then
-            echo "::error::cpu_cores must be a positive integer"
+          if [[ ! "$CPU_CORES" =~ ^[0-9]+$ ]] || (( CPU_CORES < 1 || CPU_CORES > 16 )); then
+            echo "::error::cpu_cores must be an integer from 1 through 16"
             exit 1
           fi
           if [[ ! "$DISK_SIZE" =~ ^[0-9]+G$ ]]; then
@@ -209,7 +212,7 @@ jobs:
         run: python3 scripts/libvm.py prune-old-checkpoints
 
       - name: Connect runner to Tailscale
-        uses: tailscale/github-action@v4
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
@@ -226,6 +229,7 @@ jobs:
             exit 1
           fi
           echo "ip=$TS_IP" >> "$GITHUB_OUTPUT"
+          echo "VM_BIND_ADDRESS=$TS_IP" >> "$GITHUB_ENV"
           echo "RDP: ${TS_IP}:3389"
           echo "Emergency VNC: ${TS_IP}:5900"
           tailscale status
@@ -249,13 +253,19 @@ jobs:
           final_path="work/virtio-win.iso"
           temp_path="${final_path}.part"
           rm -f "$temp_path"
+          case "$VIRTIO_ISO_URL" in
+            https://*) ;;
+            *) echo "::error::virtio_iso_url must be an absolute HTTPS URL"; exit 1 ;;
+          esac
           curl \
             --fail \
             --location \
+            --connect-timeout 30 \
             --retry 5 \
             --retry-delay 3 \
             --retry-all-errors \
-            --progress-bar \
+            --silent \
+            --show-error \
             "$VIRTIO_ISO_URL" \
             --output "$temp_path"
           if [[ -n "$VIRTIO_ISO_SHA256" ]]; then
@@ -271,6 +281,7 @@ jobs:
             fi
           fi
           mv "$temp_path" "$final_path"
+          echo "VirtIO ISO downloaded successfully"
           ls -lh "$final_path"
           echo 'The ISO is mounted read-only. In Windows, use pnputil /add-driver "D:\*.inf" /subdirs /install (the CD drive letter may differ); NetKVM is the key network driver.'
 
@@ -282,7 +293,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           for attempt in $(seq 1 90); do
-            if nc -z 127.0.0.1 5900 2>/dev/null; then
+            if nc -z "$VM_BIND_ADDRESS" 5900 2>/dev/null; then
               echo "Emergency VNC ready: ${{ steps.tailscale.outputs.ip }}:5900"
               exit 0
             fi
@@ -344,7 +355,7 @@ jobs:
 
       - name: Upload runtime logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: runtime-logs
           if-no-files-found: ignore

@@ -3,6 +3,7 @@ import argparse
 import datetime
 import fcntl
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -10,6 +11,7 @@ import shutil
 import socket
 import subprocess
 import time
+import urllib.parse
 from pathlib import Path
 ROOT=Path(os.environ.get('ROOT_DIR', Path(__file__).resolve().parents[1]))
 WORK=ROOT/'work'; LOGS=ROOT/'logs'
@@ -24,6 +26,31 @@ def storage_provider() -> str:
         supported = ", ".join(sorted(storage.get("providers", {})))
         raise RuntimeError(f"unsupported STORAGE_PROVIDER={provider!r}; supported providers: {supported}")
     return provider
+
+
+def validate_storage_endpoint(value):
+    parsed=urllib.parse.urlsplit(value)
+    if parsed.scheme.lower() != 'https' or not parsed.hostname:
+        raise RuntimeError(
+            f'storage endpoint must be an absolute HTTPS URL: {value}'
+        )
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise RuntimeError(
+            'storage endpoint must not contain credentials, a query, or a fragment'
+        )
+    return value.rstrip('/')
+
+
+def validate_tailscale_bind_address(value):
+    try:
+        address=ipaddress.ip_address(value)
+    except ValueError as error:
+        raise RuntimeError(f'invalid VM bind address: {value!r}') from error
+    if address.version != 4 or address not in ipaddress.ip_network('100.64.0.0/10'):
+        raise RuntimeError(
+            f'VM bind address must be a Tailscale IPv4 address: {value}'
+        )
+    return str(address)
 
 
 def storage_context() -> dict[str, str]:
@@ -56,13 +83,12 @@ def storage_context() -> dict[str, str]:
             host = endpoint.split("://", 1)[-1].split("/", 1)[0]
             region = host[3:].split(".backblazeb2.com", 1)[0] if host.startswith("s3.") and ".backblazeb2.com" in host else spec.get("default_region", "us-east-1")
 
-    if not endpoint.startswith(("https://", "http://")):
-        raise RuntimeError(f"storage endpoint must include http:// or https://: {endpoint}")
+    endpoint = validate_storage_endpoint(endpoint)
 
     return {
         "provider": provider,
         "bucket": bucket,
-        "endpoint": endpoint.rstrip("/"),
+        "endpoint": endpoint,
         "access_key": access_key,
         "secret_key": secret_key,
         "region": region,
@@ -105,6 +131,7 @@ def verify_sha(path, sha_file):
             f"checksum mismatch for {path}: expected {expected}, got {got}"
         )
     log(f"sha256 verified: {path}")
+    return got
 def aws_env():
     context = storage_context()
     env = os.environ.copy()
@@ -382,9 +409,18 @@ class QMP:
         deadline=time.time()+self.timeout
         while True:
             try:
-                self.s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); self.s.settimeout(3); self.s.connect(self.sock_path); break
-            except Exception:
-                if time.time()>deadline: raise
+                self.s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.s.settimeout(min(3, max(0.1, deadline-time.time())))
+                self.s.connect(self.sock_path)
+                break
+            except (FileNotFoundError, ConnectionRefusedError, socket.timeout, OSError):
+                if self.s is not None:
+                    self.s.close()
+                    self.s=None
+                if time.time()>deadline:
+                    raise TimeoutError(
+                        f'QMP socket did not become ready: {self.sock_path}'
+                    )
                 time.sleep(1)
         self._recv(); self.cmd('qmp_capabilities'); return self
     def __exit__(self,*a):
@@ -414,6 +450,7 @@ class QMP:
         deadline=time.time()+self.timeout
         replies=[]
         while time.time()<deadline:
+            self.s.settimeout(max(0.1, deadline-time.time()))
             for r in self._recv():
                 replies.append(r)
                 if 'return' in r: return r['return']
@@ -428,6 +465,9 @@ def boot():
     overlay=ROOT/v['overlay_image']
     virtio_iso=WORK/'virtio-win.iso'
     requested_disk_size=v.get('disk_size','220G')
+    bind_address=validate_tailscale_bind_address(
+        os.environ.get('VM_BIND_ADDRESS','').strip()
+    )
 
     if not base.exists():
         raise SystemExit(f"missing base image: {base}")
@@ -462,13 +502,13 @@ def boot():
         '-device','ide-cd,drive=virtiocd',
         '-netdev',(
             f"user,id={v['network_user_id']},"
-            f"hostfwd=tcp:0.0.0.0:{v['rdp_host_port']}-:{v['rdp_guest_port']}"
+            f"hostfwd=tcp:{bind_address}:{v['rdp_host_port']}-:{v['rdp_guest_port']}"
         ),
         '-device',f"virtio-net-pci,netdev={v['network_user_id']}",
         '-qmp',f"unix:{sock},server=on,wait=off",
         '-pidfile',str(pid),
         '-daemonize',
-        '-vnc',f"{v.get('vnc_listen','0.0.0.0')}:{v.get('vnc_display',0)}",
+        '-vnc',f"{bind_address}:{v.get('vnc_display',0)}",
         '-serial','file:'+str(ROOT/v['monitor_log']),
     ]
 
@@ -478,9 +518,12 @@ def boot():
         f"VirtIO driver ISO mounted as CD-ROM"
     )
 def wait_rdp(timeout=900):
+    address=validate_tailscale_bind_address(
+        os.environ.get('VM_BIND_ADDRESS','').strip()
+    )
     port=cfg('vm.json')['rdp_host_port']; end=time.time()+timeout
     while time.time()<end:
-        rc=subprocess.run(['nc','-z','127.0.0.1',str(port)]).returncode
+        rc=subprocess.run(['nc','-z',address,str(port)]).returncode
         if rc==0: log('rdp ready'); return
         time.sleep(5)
     raise SystemExit('rdp did not become ready')
@@ -490,9 +533,14 @@ def qemu_pid(v=None):
 
     try:
         text = pid_file.read_text(encoding='utf-8').strip()
-        return int(text)
+        pid=int(text)
+        return pid if pid > 1 else None
     except (FileNotFoundError, ValueError, OSError):
         return None
+
+
+def process_cmdline(pid):
+    return (Path('/proc')/str(pid)/'cmdline').read_bytes()
 
 def qemu_is_running(v=None):
     v = v or cfg('vm.json')
@@ -501,11 +549,18 @@ def qemu_is_running(v=None):
     if pid is None:
         return False
 
-    return subprocess.run(
-        ['kill', '-0', str(pid)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    ).returncode == 0
+    try:
+        os.kill(pid,0)
+        cmdline=process_cmdline(pid)
+    except (ProcessLookupError, PermissionError, FileNotFoundError, OSError):
+        return False
+
+    arguments=[part.decode(errors='replace') for part in cmdline.split(b'\0') if part]
+    if not arguments or not Path(arguments[0]).name.startswith('qemu-system-'):
+        return False
+
+    expected_overlay=str(ROOT/v['overlay_image'])
+    return any(expected_overlay in argument for argument in arguments[1:])
 
 def wait_for_qemu_exit(v=None, timeout=30):
     v = v or cfg('vm.json')
@@ -525,15 +580,9 @@ def shutdown():
 
     qmp_cmd('system_powerdown')
     log('qmp system_powerdown sent')
-    pid=ROOT/cfg('vm.json')['pid_file']
-    if pid.exists():
-        p=int(pid.read_text().strip());
+    if qemu_pid() is not None:
         for _ in range(60):
-            if subprocess.run(
-                ['kill','-0',str(p)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            ).returncode!=0:
+            if not qemu_is_running():
                 log('QEMU exited after ACPI shutdown')
                 return
             time.sleep(5)
@@ -761,6 +810,12 @@ def checkpoint(name='latest'):
                     'refusing an unsafe direct read of the active overlay'
                 )
 
+            elif qmp_available:
+                raise RuntimeError(
+                    'QMP socket exists but the QEMU process identity cannot '
+                    'be verified; refusing an unsafe direct read of the overlay'
+                )
+
             else:
                 # Missing qemu.pid and QMP socket are expected after a normal
                 # Windows shutdown. Never issue QMP commands on this path.
@@ -794,8 +849,18 @@ def checkpoint(name='latest'):
             # Compression must finish completely before any upload starts.
             compress(checkpoint_source,comp)
             digest=write_sha(comp,sha)
+            base_digest_file=WORK/'base.sha256'
+            if base_digest_file.exists():
+                base_digest=base_digest_file.read_text(encoding='utf-8').split()[0].lower()
+            else:
+                base_digest=''
+            if not re.fullmatch(r'[0-9a-f]{64}',base_digest):
+                base_digest=sha256(base)
+                atomic_write_text(
+                    base_digest_file,f'{base_digest}  {base.name}\n'
+                )
             manifest={
-                'version':2,
+                'version':3,
                 'created_utc':datetime.datetime.now(
                     datetime.timezone.utc
                 ).replace(microsecond=0).isoformat().replace('+00:00','Z'),
@@ -803,6 +868,7 @@ def checkpoint(name='latest'):
                 'sha256':digest,
                 'compressed':'overlay.qcow2.zst',
                 'base_object':s['base_object'],
+                'base_sha256':base_digest,
                 'checkpoint_mode':checkpoint_mode,
                 'checkpoint_interval_minutes':c.get('interval_minutes',15),
                 'compression_level':c.get('compression_level',10),
@@ -910,6 +976,44 @@ def download_object_atomic(object_name,destination,c):
         temporary.unlink(missing_ok=True)
 
 
+def validate_checkpoint_manifest(path,archive_digest,base_digest,storage):
+    try:
+        manifest=json.loads(Path(path).read_text(encoding='utf-8'))
+    except (OSError,UnicodeError,json.JSONDecodeError) as error:
+        raise RuntimeError(f'invalid checkpoint manifest: {error}') from error
+
+    if not isinstance(manifest,dict):
+        raise RuntimeError('invalid checkpoint manifest: root must be an object')
+    if manifest.get('name') != 'latest':
+        raise RuntimeError('invalid checkpoint manifest: name must be latest')
+    if manifest.get('compressed') != 'overlay.qcow2.zst':
+        raise RuntimeError('invalid checkpoint manifest: unexpected archive name')
+    if manifest.get('sha256','').lower() != archive_digest.lower():
+        raise RuntimeError('checkpoint manifest digest does not match SHA256 sidecar')
+    if manifest.get('base_object') != storage['base_object']:
+        raise RuntimeError('checkpoint manifest references a different base object')
+
+    version=manifest.get('version')
+    if not isinstance(version,int) or version < 2:
+        raise RuntimeError(f'unsupported checkpoint manifest version: {version!r}')
+    manifest_base_digest=manifest.get('base_sha256')
+    if version >= 3:
+        if not isinstance(manifest_base_digest,str) or not re.fullmatch(
+            r'[0-9a-fA-F]{64}',manifest_base_digest
+        ):
+            raise RuntimeError('checkpoint manifest has an invalid base SHA256')
+        if manifest_base_digest.lower() != base_digest.lower():
+            raise RuntimeError(
+                'immutable base SHA256 does not match the checkpoint manifest'
+            )
+    else:
+        log(
+            'WARNING: legacy v2 checkpoint manifest has no base SHA256; '
+            'the next verified checkpoint will upgrade it to v3'
+        )
+    return manifest
+
+
 def restore():
     v=cfg('vm.json')
     s=cfg('storage.json')
@@ -918,9 +1022,10 @@ def restore():
     comp=ROOT/v['overlay_compressed']
     overlay=ROOT/v['overlay_image']
     sha=WORK/'overlay.sha256'
+    manifest_path=WORK/'manifest.restore.json'
     allow_fresh=env_boolean('ALLOW_FRESH_OVERLAY_IF_MISSING',False)
 
-    for path in [overlay,Path(str(overlay)+'.tmp')]:
+    for path in [overlay,Path(str(overlay)+'.tmp'),manifest_path]:
         path.unlink(missing_ok=True)
 
     log(f'downloading immutable base image: {s3_uri(s["base_object"])}')
@@ -947,10 +1052,21 @@ def restore():
 
         log('overlay archive downloaded successfully from latest')
         download_object_atomic(s['latest_sha256_object'],sha,c)
-        verify_sha(comp,sha)
+        archive_digest=verify_sha(comp,sha)
+        download_object_atomic(s['manifest_object'],manifest_path,c)
+        base_digest=sha256(base)
+        atomic_write_text(WORK/'base.sha256',f'{base_digest}  {base.name}\n')
+        manifest=validate_checkpoint_manifest(
+            manifest_path,archive_digest,base_digest,s
+        )
         decompress(comp,overlay)
         normalize_overlay_backing(overlay,base)
         run(['qemu-img','check',overlay])
+        expected_size=manifest.get('virtual_disk_size_bytes')
+        if expected_size is not None and qemu_virtual_size(overlay) != int(expected_size):
+            raise RuntimeError(
+                'restored overlay virtual size does not match checkpoint manifest'
+            )
         log('restored overlay from latest')
     except Exception as error:
         overlay.unlink(missing_ok=True)
@@ -975,6 +1091,7 @@ def restore():
         # frees space for the next atomic compression output.
         comp.unlink(missing_ok=True)
         Path(str(comp)+'.download.tmp').unlink(missing_ok=True)
+        manifest_path.unlink(missing_ok=True)
 def retry(maxn,delay,cap,func,*args):
     n=1
     while True:
@@ -995,7 +1112,7 @@ def retry(maxn,delay,cap,func,*args):
             delay=min(delay*2,cap)
 def main():
     p=argparse.ArgumentParser(); sub=p.add_subparsers(dest='cmd', required=True)
-    for x in ['boot','restore','shutdown','prune-old-checkpoints']: sub.add_parser(x)
+    for x in ['boot','restore','shutdown','prune-old-checkpoints','is-running']: sub.add_parser(x)
     a=sub.add_parser('wait-rdp'); a.add_argument('--timeout',type=int,default=900)
     a=sub.add_parser('checkpoint'); a.add_argument('--name',default='latest')
     a=sub.add_parser('sha256'); a.add_argument('path'); a.add_argument('out')
@@ -1022,4 +1139,5 @@ def main():
     elif ns.cmd=='create-overlay': create_overlay(ns.base, ns.overlay)
     elif ns.cmd=='compress': compress(ns.src, ns.dst)
     elif ns.cmd=='decompress': decompress(ns.src, ns.dst)
+    elif ns.cmd=='is-running': raise SystemExit(0 if qemu_is_running() else 1)
 if __name__=='__main__': main()
