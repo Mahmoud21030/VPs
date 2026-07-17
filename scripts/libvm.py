@@ -136,6 +136,7 @@ def aws_cp(src, dst):
         '--endpoint-url', endpoint(),
         's3', 'cp',
         src, dst,
+        '--no-progress',
     ]
 
     # AWS CLI v2 tries to preserve tags and metadata during S3-to-S3
@@ -147,10 +148,13 @@ def aws_cp(src, dst):
         cmd.extend(['--copy-props', 'none'])
         log(f'remote object copy without tags/metadata: {src} -> {dst}')
 
-    # Keep AWS CLI progress and error output visible. In particular, restore
-    # failures must show the complete provider error rather than being hidden
-    # behind an existence probe or --only-show-errors.
-    return run(cmd, env=aws_env())
+    # GitHub Actions renders the AWS CLI's carriage-return progress refreshes
+    # as hundreds of separate log lines. Disable only that progress renderer;
+    # do not use --quiet or --only-show-errors, because restore failures must
+    # still print the complete provider error.
+    result = run(cmd, env=aws_env())
+    log(f'object transfer completed: {src} -> {dst}')
+    return result
 def aws_rm_recursive(uri):
     return run(
         [

@@ -290,6 +290,7 @@ class CoreTests(unittest.TestCase):
             libvm,'run',side_effect=lambda command,**kwargs:captured.append(command)
         ), mock.patch.object(libvm,'log'):
             libvm.aws_cp('s3://bucket/source','s3://bucket/destination')
+        self.assertIn('--no-progress',captured[0])
         self.assertEqual(captured[0][-2:],['--copy-props','none'])
 
     def test_all_workflow_yaml_parses(self):

@@ -88,6 +88,8 @@ VNC remains active even when RDP works.
 
 Restore always downloads `base.qcow2`, directly downloads `latest/overlay.qcow2.zst`, downloads the SHA256 sidecar, verifies it, and only then decompresses and checks the overlay. It does not use a quiet `aws s3 ls` existence probe.
 
+AWS object transfers disable the CLI's carriage-return progress renderer because GitHub Actions expands every refresh into a separate log line. Storage errors remain fully visible, and each successful transfer prints one timestamped completion line.
+
 Missing, inaccessible, corrupt, or undecompressible latest state fails the job by default. A blank overlay is created only when `allow_fresh_overlay_if_missing=true` was selected deliberately.
 
 ## Disk growth
