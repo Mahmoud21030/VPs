@@ -199,14 +199,21 @@ def safe_download_url(url: str) -> str:
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
 
-def tailscale_bind_address() -> str:
+def vm_bind_address() -> str:
     value = os.environ.get("VM_BIND_ADDRESS", "").strip()
+    provider = os.environ.get("NETWORK_PROVIDER", "tailscale").strip().lower()
     try:
         address = ipaddress.ip_address(value)
     except ValueError as error:
         raise RuntimeError(f"invalid VM bind address: {value!r}") from error
-    if address.version != 4 or address not in ipaddress.ip_network("100.64.0.0/10"):
+    if address.version != 4:
+        raise RuntimeError(f"VM bind address must be IPv4: {value}")
+    if provider == "tailscale" and address not in ipaddress.ip_network("100.64.0.0/10"):
         raise RuntimeError(f"VM bind address must be a Tailscale IPv4 address: {value}")
+    if provider in {"cloudflare", "ssh-relay"} and not address.is_loopback:
+        raise RuntimeError(f"{provider} requires a loopback VM bind address: {value}")
+    if provider not in {"tailscale", "cloudflare", "ssh-relay"}:
+        raise RuntimeError(f"unsupported NETWORK_PROVIDER: {provider!r}")
     return str(address)
 
 
@@ -281,7 +288,7 @@ def wait_for_poweroff(pidfile: str | Path, timeout_seconds: int) -> None:
 def build(args: argparse.Namespace) -> None:
     vm = cfg("vm.json")
     checkpoint = cfg("checkpoint.json")
-    bind_address = tailscale_bind_address()
+    bind_address = vm_bind_address()
 
     requested_disk_bytes = parse_qemu_size(args.disk_size)
     if requested_disk_bytes < 81 * (1024 ** 3):

@@ -41,15 +41,24 @@ def validate_storage_endpoint(value):
     return value.rstrip('/')
 
 
-def validate_tailscale_bind_address(value):
+def validate_vm_bind_address(value,provider=None):
+    provider=(provider or os.environ.get('NETWORK_PROVIDER','tailscale')).strip().lower()
     try:
         address=ipaddress.ip_address(value)
     except ValueError as error:
         raise RuntimeError(f'invalid VM bind address: {value!r}') from error
-    if address.version != 4 or address not in ipaddress.ip_network('100.64.0.0/10'):
+    if address.version != 4:
+        raise RuntimeError(f'VM bind address must be IPv4: {value}')
+    if provider == 'tailscale' and address not in ipaddress.ip_network('100.64.0.0/10'):
         raise RuntimeError(
             f'VM bind address must be a Tailscale IPv4 address: {value}'
         )
+    if provider in {'cloudflare','ssh-relay'} and not address.is_loopback:
+        raise RuntimeError(
+            f'{provider} requires a loopback VM bind address: {value}'
+        )
+    if provider not in {'tailscale','cloudflare','ssh-relay'}:
+        raise RuntimeError(f'unsupported NETWORK_PROVIDER: {provider!r}')
     return str(address)
 
 
@@ -465,7 +474,7 @@ def boot():
     overlay=ROOT/v['overlay_image']
     virtio_iso=WORK/'virtio-win.iso'
     requested_disk_size=v.get('disk_size','220G')
-    bind_address=validate_tailscale_bind_address(
+    bind_address=validate_vm_bind_address(
         os.environ.get('VM_BIND_ADDRESS','').strip()
     )
 
@@ -518,7 +527,7 @@ def boot():
         f"VirtIO driver ISO mounted as CD-ROM"
     )
 def wait_rdp(timeout=900):
-    address=validate_tailscale_bind_address(
+    address=validate_vm_bind_address(
         os.environ.get('VM_BIND_ADDRESS','').strip()
     )
     port=cfg('vm.json')['rdp_host_port']; end=time.time()+timeout

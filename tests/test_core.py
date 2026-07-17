@@ -362,12 +362,19 @@ class CoreTests(unittest.TestCase):
 
     def test_vm_listeners_require_a_tailscale_ipv4_address(self):
         self.assertEqual(
-            libvm.validate_tailscale_bind_address('100.100.10.20'),
+            libvm.validate_vm_bind_address('100.100.10.20','tailscale'),
             '100.100.10.20',
         )
         for address in ('0.0.0.0','127.0.0.1','192.168.1.10','not-an-ip'):
             with self.assertRaises(RuntimeError):
-                libvm.validate_tailscale_bind_address(address)
+                libvm.validate_vm_bind_address(address,'tailscale')
+        for provider in ('cloudflare','ssh-relay'):
+            self.assertEqual(
+                libvm.validate_vm_bind_address('127.0.0.1',provider),
+                '127.0.0.1',
+            )
+            with self.assertRaises(RuntimeError):
+                libvm.validate_vm_bind_address('0.0.0.0',provider)
 
     def test_base_download_urls_are_https_and_redacted(self):
         self.assertEqual(
@@ -424,6 +431,21 @@ class CoreTests(unittest.TestCase):
             Loader=yaml.BaseLoader,
         )
         self.assertEqual(dependabot.get('version'),'2')
+
+    def test_vm_workflows_offer_three_network_providers(self):
+        for name in ('runtime.yml','base-image.yml'):
+            workflow=yaml.load(
+                (ROOT/'.github'/'workflows'/name).read_text(encoding='utf-8'),
+                Loader=yaml.BaseLoader,
+            )
+            options=workflow['on']['workflow_dispatch']['inputs'][
+                'network_provider'
+            ]['options']
+            self.assertEqual(options,['tailscale','cloudflare','ssh-relay'])
+
+        source=(ROOT/'scripts/libvm.py').read_text(encoding='utf-8')
+        self.assertNotIn('hostfwd=tcp:0.0.0.0',source)
+        self.assertNotIn("'-vnc',f\"0.0.0.0",source)
 
 
 if __name__ == '__main__':

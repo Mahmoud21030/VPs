@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+source "$(dirname "$0")/../common.sh"
+
+provider="${NETWORK_PROVIDER:-tailscale}"
+output_file="${GITHUB_OUTPUT:-/dev/null}"
+environment_file="${GITHUB_ENV:-/dev/null}"
+
+write_address() {
+  local address="$1"
+  printf 'address=%s\n' "$address" >> "$output_file"
+  printf 'VM_BIND_ADDRESS=%s\n' "$address" >> "$environment_file"
+  log "network provider ready: provider=$provider bind_address=$address"
+}
+
+validate_port() {
+  local name="$1" value="$2"
+  if [[ ! "$value" =~ ^[0-9]+$ ]] || (( value < 1024 || value > 65535 )); then
+    echo "$name must be an integer from 1024 through 65535" >&2
+    exit 2
+  fi
+}
+
+case "$provider" in
+  tailscale)
+    require tailscale
+    address="$(tailscale ip -4 | head -n 1)"
+    [[ -n "$address" ]] || { echo "could not determine Tailscale IPv4 address" >&2; exit 1; }
+    tailscale status
+    write_address "$address"
+    ;;
+
+  cloudflare)
+    : "${CLOUDFLARE_TUNNEL_TOKEN:?CLOUDFLARE_TUNNEL_TOKEN is required}"
+    : "${CLOUDFLARE_RDP_HOSTNAME:?cloudflare_rdp_hostname is required}"
+    : "${CLOUDFLARE_VNC_HOSTNAME:?cloudflare_vnc_hostname is required}"
+    for hostname in "$CLOUDFLARE_RDP_HOSTNAME" "$CLOUDFLARE_VNC_HOSTNAME"; do
+      if [[ ! "$hostname" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ || "$hostname" != *.* ]]; then
+        echo "invalid Cloudflare hostname: $hostname" >&2
+        exit 2
+      fi
+    done
+
+    if ! command -v cloudflared >/dev/null 2>&1; then
+      log "installing cloudflared from Cloudflare's signed apt repository"
+      sudo mkdir -p --mode=0755 /usr/share/keyrings
+      curl --fail --silent --show-error --location \
+        https://pkg.cloudflare.com/cloudflare-main.gpg \
+        | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+      echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' \
+        | sudo tee /etc/apt/sources.list.d/cloudflared.list >/dev/null
+      sudo apt-get update
+      sudo apt-get install -y cloudflared
+    fi
+
+    TUNNEL_TOKEN="$CLOUDFLARE_TUNNEL_TOKEN" \
+      cloudflared tunnel --no-autoupdate --loglevel info \
+      --metrics 127.0.0.1:20241 run \
+      > "$LOG_DIR/cloudflared.log" 2>&1 &
+    tunnel_pid=$!
+    printf '%s\n' "$tunnel_pid" > "$WORK_DIR/cloudflared.pid"
+
+    for _ in $(seq 1 60); do
+      if curl --fail --silent http://127.0.0.1:20241/ready >/dev/null 2>&1; then
+        write_address 127.0.0.1
+        exit 0
+      fi
+      if ! kill -0 "$tunnel_pid" 2>/dev/null; then
+        echo "cloudflared exited before the tunnel became ready" >&2
+        tail -n 100 "$LOG_DIR/cloudflared.log" >&2
+        wait "$tunnel_pid"
+      fi
+      sleep 1
+    done
+    echo "cloudflared tunnel did not become ready within 60 seconds" >&2
+    exit 1
+    ;;
+
+  ssh-relay)
+    : "${SSH_RELAY_HOST:?ssh_relay_host is required}"
+    : "${SSH_RELAY_USER:?ssh_relay_user is required}"
+    : "${SSH_RELAY_PRIVATE_KEY:?SSH_RELAY_PRIVATE_KEY is required}"
+    : "${SSH_RELAY_KNOWN_HOSTS:?SSH_RELAY_KNOWN_HOSTS is required}"
+    relay_ssh_port="${SSH_RELAY_PORT:-22}"
+    relay_rdp_port="${SSH_RELAY_RDP_PORT:-13389}"
+    relay_vnc_port="${SSH_RELAY_VNC_PORT:-15900}"
+    validate_port ssh_relay_port "$relay_ssh_port"
+    validate_port ssh_relay_rdp_port "$relay_rdp_port"
+    validate_port ssh_relay_vnc_port "$relay_vnc_port"
+    [[ "$relay_rdp_port" != "$relay_vnc_port" ]] || {
+      echo "SSH relay RDP and VNC ports must differ" >&2
+      exit 2
+    }
+    [[ "$SSH_RELAY_USER" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || {
+      echo "invalid SSH relay user" >&2
+      exit 2
+    }
+    [[ "$SSH_RELAY_HOST" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || {
+      echo "invalid SSH relay hostname" >&2
+      exit 2
+    }
+
+    ssh_dir="$WORK_DIR/ssh-relay"
+    install -d -m 0700 "$ssh_dir"
+    printf '%s\n' "$SSH_RELAY_PRIVATE_KEY" > "$ssh_dir/id"
+    printf '%s\n' "$SSH_RELAY_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
+    chmod 0600 "$ssh_dir/id" "$ssh_dir/known_hosts"
+
+    ssh -N -T \
+      -i "$ssh_dir/id" \
+      -p "$relay_ssh_port" \
+      -o BatchMode=yes \
+      -o ExitOnForwardFailure=yes \
+      -o IdentitiesOnly=yes \
+      -o ServerAliveInterval=30 \
+      -o ServerAliveCountMax=3 \
+      -o StrictHostKeyChecking=yes \
+      -o UserKnownHostsFile="$ssh_dir/known_hosts" \
+      -R "127.0.0.1:${relay_rdp_port}:127.0.0.1:3389" \
+      -R "127.0.0.1:${relay_vnc_port}:127.0.0.1:5900" \
+      "${SSH_RELAY_USER}@${SSH_RELAY_HOST}" \
+      > "$LOG_DIR/ssh-relay.log" 2>&1 &
+    relay_pid=$!
+    printf '%s\n' "$relay_pid" > "$WORK_DIR/ssh-relay.pid"
+    sleep 3
+    if ! kill -0 "$relay_pid" 2>/dev/null; then
+      echo "SSH reverse relay failed to start" >&2
+      cat "$LOG_DIR/ssh-relay.log" >&2
+      wait "$relay_pid"
+    fi
+    write_address 127.0.0.1
+    ;;
+
+  *)
+    echo "unsupported NETWORK_PROVIDER: $provider" >&2
+    exit 2
+    ;;
+esac

@@ -11,6 +11,50 @@ on:
         options:
           - backblaze
           - oracle
+      network_provider:
+        description: Private connectivity or authenticated relay provider
+        required: true
+        default: tailscale
+        type: choice
+        options:
+          - tailscale
+          - cloudflare
+          - ssh-relay
+      cloudflare_rdp_hostname:
+        description: Cloudflare Access TCP hostname routed to tcp://127.0.0.1:3389
+        required: false
+        default: ""
+        type: string
+      cloudflare_vnc_hostname:
+        description: Cloudflare Access TCP hostname routed to tcp://127.0.0.1:5900
+        required: false
+        default: ""
+        type: string
+      ssh_relay_host:
+        description: SSH VPS or bastion hostname for reverse forwarding
+        required: false
+        default: ""
+        type: string
+      ssh_relay_user:
+        description: SSH relay login user
+        required: false
+        default: ""
+        type: string
+      ssh_relay_port:
+        description: SSH relay server port
+        required: false
+        default: "22"
+        type: string
+      ssh_relay_rdp_port:
+        description: Loopback-only RDP port created on the SSH relay
+        required: false
+        default: "13389"
+        type: string
+      ssh_relay_vnc_port:
+        description: Loopback-only VNC port created on the SSH relay
+        required: false
+        default: "15900"
+        type: string
       memory_mb:
         description: VM memory in MB
         required: false
@@ -71,6 +115,7 @@ jobs:
 
     env:
       STORAGE_PROVIDER: ${{ inputs.storage_provider || vars.STORAGE_PROVIDER || 'backblaze' }}
+      NETWORK_PROVIDER: ${{ inputs.network_provider || 'tailscale' }}
       ALLOW_FRESH_OVERLAY_IF_MISSING: ${{ inputs.allow_fresh_overlay_if_missing }}
       B2_BUCKET: ${{ secrets.B2_BUCKET }}
       B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
@@ -83,6 +128,9 @@ jobs:
       ORACLE_ENDPOINT: ${{ secrets.ORACLE_ENDPOINT }}
       ORACLE_ACCESS_KEY_ID: ${{ secrets.ORACLE_ACCESS_KEY_ID }}
       ORACLE_SECRET_ACCESS_KEY: ${{ secrets.ORACLE_SECRET_ACCESS_KEY }}
+      CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+      SSH_RELAY_PRIVATE_KEY: ${{ secrets.SSH_RELAY_PRIVATE_KEY }}
+      SSH_RELAY_KNOWN_HOSTS: ${{ secrets.SSH_RELAY_KNOWN_HOSTS }}
       AWS_REQUEST_CHECKSUM_CALCULATION: when_required
       AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
       AWS_EC2_METADATA_DISABLED: "true"
@@ -212,33 +260,53 @@ jobs:
         run: python3 scripts/libvm.py prune-old-checkpoints
 
       - name: Connect runner to Tailscale
+        if: inputs.network_provider == 'tailscale'
         uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
 
-      - name: Show private RDP and emergency VNC addresses
-        id: tailscale
+      - name: Start selected private network or relay
+        id: network
         shell: bash
+        env:
+          CLOUDFLARE_RDP_HOSTNAME: ${{ inputs.cloudflare_rdp_hostname }}
+          CLOUDFLARE_VNC_HOSTNAME: ${{ inputs.cloudflare_vnc_hostname }}
+          SSH_RELAY_HOST: ${{ inputs.ssh_relay_host }}
+          SSH_RELAY_USER: ${{ inputs.ssh_relay_user }}
+          SSH_RELAY_PORT: ${{ inputs.ssh_relay_port }}
+          SSH_RELAY_RDP_PORT: ${{ inputs.ssh_relay_rdp_port }}
+          SSH_RELAY_VNC_PORT: ${{ inputs.ssh_relay_vnc_port }}
+        run: scripts/network/setup
+
+      - name: Show RDP and emergency VNC connection instructions
+        shell: bash
+        env:
+          CLOUDFLARE_RDP_HOSTNAME: ${{ inputs.cloudflare_rdp_hostname }}
+          CLOUDFLARE_VNC_HOSTNAME: ${{ inputs.cloudflare_vnc_hostname }}
+          SSH_RELAY_HOST: ${{ inputs.ssh_relay_host }}
+          SSH_RELAY_USER: ${{ inputs.ssh_relay_user }}
+          SSH_RELAY_PORT: ${{ inputs.ssh_relay_port }}
+          SSH_RELAY_RDP_PORT: ${{ inputs.ssh_relay_rdp_port }}
+          SSH_RELAY_VNC_PORT: ${{ inputs.ssh_relay_vnc_port }}
         run: |
           set -Eeuo pipefail
-          TS_IP="$(tailscale ip -4 | head -n 1)"
-          if [[ -z "$TS_IP" ]]; then
-            echo "::error::Could not determine the Tailscale IPv4 address"
-            exit 1
-          fi
-          echo "ip=$TS_IP" >> "$GITHUB_OUTPUT"
-          echo "VM_BIND_ADDRESS=$TS_IP" >> "$GITHUB_ENV"
-          echo "RDP: ${TS_IP}:3389"
-          echo "Emergency VNC: ${TS_IP}:5900"
-          tailscale status
-          {
-            echo "### Windows VM connection"
-            echo
-            echo "- RDP: \`${TS_IP}:3389\`"
-            echo "- Emergency VNC: \`${TS_IP}:5900\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+          case "$NETWORK_PROVIDER" in
+            tailscale)
+              address="${{ steps.network.outputs.address }}"
+              instructions="RDP: ${address}:3389 | Emergency VNC: ${address}:5900"
+              ;;
+            cloudflare)
+              instructions="Run cloudflared access tcp --hostname ${CLOUDFLARE_RDP_HOSTNAME} --url localhost:13389 for RDP, and use local port 15900 with ${CLOUDFLARE_VNC_HOSTNAME} for VNC"
+              ;;
+            ssh-relay)
+              instructions="On your client run: ssh -p ${SSH_RELAY_PORT} -N -L 13389:127.0.0.1:${SSH_RELAY_RDP_PORT} -L 15900:127.0.0.1:${SSH_RELAY_VNC_PORT} ${SSH_RELAY_USER}@${SSH_RELAY_HOST}"
+              ;;
+            *) exit 2 ;;
+          esac
+          echo "$instructions"
+          printf '### Windows VM connection\n\n`%s`\n' "$instructions" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Restore persistent base and latest overlay
         run: scripts/restore/restore
@@ -294,12 +362,11 @@ jobs:
           set -Eeuo pipefail
           for attempt in $(seq 1 90); do
             if nc -z "$VM_BIND_ADDRESS" 5900 2>/dev/null; then
-              echo "Emergency VNC ready: ${{ steps.tailscale.outputs.ip }}:5900"
+              echo "Emergency VNC listener is ready through $NETWORK_PROVIDER"
               exit 0
             fi
             if [[ -f work/qemu.pid ]]; then
-              QEMU_PID="$(cat work/qemu.pid)"
-              if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+              if ! python3 scripts/libvm.py is-running; then
                 echo "::error::QEMU exited before VNC became ready"
                 tail -n 200 work/qemu.log || true
                 exit 1
@@ -320,8 +387,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          echo "RDP: ${{ steps.tailscale.outputs.ip }}:3389"
-          echo "Emergency VNC: ${{ steps.tailscale.outputs.ip }}:5900"
+          echo "Connectivity provider: $NETWORK_PROVIDER"
           if [[ "${{ steps.rdp.outcome }}" == "success" ]]; then
             echo "RDP is ready; VNC remains active as the emergency console."
           else
@@ -352,6 +418,10 @@ jobs:
         if: always()
         timeout-minutes: 55
         run: scripts/cleanup/cleanup
+
+      - name: Stop selected network or relay
+        if: always()
+        run: scripts/network/cleanup
 
       - name: Upload runtime logs
         if: always()

@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+source "$(dirname "$0")/../common.sh"
+
+stop_process() {
+  local pid_file="$1" expected="$2" label="$3" pid
+  [[ -f "$pid_file" ]] || return 0
+  pid="$(cat "$pid_file")"
+  if pid_matches_command "$pid" "$expected"; then
+    log "stopping $label PID $pid"
+    kill "$pid"
+    for _ in $(seq 1 30); do
+      pid_matches_command "$pid" "$expected" || break
+      sleep 1
+    done
+  fi
+  rm -f "$pid_file"
+}
+
+stop_process "$WORK_DIR/cloudflared.pid" cloudflared "Cloudflare tunnel"
+stop_process "$WORK_DIR/ssh-relay.pid" "ssh -N -T" "SSH reverse relay"
+rm -rf "$WORK_DIR/ssh-relay"
+log "network provider cleanup completed"

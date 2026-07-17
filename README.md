@@ -1,6 +1,6 @@
 # Persistent Windows VM in GitHub Actions
 
-This repository runs a persistent Windows virtual machine entirely inside a GitHub-hosted `ubuntu-latest` job. It uses QEMU/KVM with a Q35 machine, OVMF UEFI, an immutable QCOW2 base, a writable sparse QCOW2 overlay, VirtIO storage/networking, Tailscale, RDP, and a permanently available emergency VNC console.
+This repository runs a persistent Windows virtual machine entirely inside a GitHub-hosted `ubuntu-latest` job. It uses QEMU/KVM with a Q35 machine, OVMF UEFI, an immutable QCOW2 base, a writable sparse QCOW2 overlay, VirtIO storage/networking, selectable Tailscale/Cloudflare/SSH-relay connectivity, RDP, and a permanently available emergency VNC console.
 
 It is intentionally not a cloud VM, self-hosted runner, Windows runner, or Windows container.
 
@@ -25,6 +25,18 @@ Common Tailscale secrets:
 - `TS_OAUTH_SECRET`
 
 The OAuth client must be allowed to create `tag:ci` devices.
+
+Cloudflare Tunnel alternative:
+
+- `CLOUDFLARE_TUNNEL_TOKEN`
+- Two remotely managed TCP hostnames configured for `tcp://127.0.0.1:3389` and `tcp://127.0.0.1:5900`
+- Cloudflare Access policies protecting both hostnames
+
+SSH reverse-relay alternative:
+
+- `SSH_RELAY_PRIVATE_KEY`
+- `SSH_RELAY_KNOWN_HOSTS`
+- A VPS/bastion account that permits remote TCP forwarding
 
 Backblaze B2:
 
@@ -64,6 +76,7 @@ The copy workflow `.github/workflows/copy-base-to-oracle.yml` can stage the Back
 Run `.github/workflows/runtime.yml` and select:
 
 - `storage_provider`: `backblaze` or `oracle`
+- `network_provider`: `tailscale`, `cloudflare`, or `ssh-relay`
 - `memory_mb`: default `15360`
 - `cpu_cores`: default `4`
 - `disk_size`: default `220G`; whole-GiB values strictly above `80G`
@@ -75,16 +88,16 @@ Run `.github/workflows/runtime.yml` and select:
 
 The job prints its OS, CPU, logical CPU count, RAM, swap, block devices, filesystems, mount points, available capacity, and raw free bytes before checkout. It then places the physical VM working directory on the writable Linux filesystem with the most free space and symlinks repository `work/` to it. Linux mount points are discovered dynamically; no Windows-style host drive letters are assumed.
 
-Connection addresses are private Tailscale endpoints:
+With Tailscale, connection addresses are private tailnet endpoints:
 
 ```text
 RDP: <TAILSCALE_IP>:3389
 VNC: <TAILSCALE_IP>:5900
 ```
 
-VNC remains active even when RDP works.
+Cloudflare uses authenticated TCP hostnames and requires `cloudflared access tcp` on the client. SSH relay creates loopback-only reverse ports on your VPS; use an SSH local-forward command printed by the workflow to reach them. VNC remains active with every provider even when RDP works.
 
-QEMU binds both forwarded ports directly to the runner's Tailscale IPv4 address rather than every host interface. Workflow inputs are passed through environment variables instead of being interpolated into shell programs, and third-party Actions are pinned to immutable commit SHAs.
+QEMU binds both forwarded ports directly to the Tailscale IPv4 address or to loopback for Cloudflare/SSH relay, never every host interface. Workflow inputs are passed through environment variables instead of being interpolated into shell programs, and third-party Actions are pinned to immutable commit SHAs.
 
 ## Restore safety
 

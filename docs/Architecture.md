@@ -2,7 +2,7 @@
 
 The Windows guest runs under QEMU/KVM on `ubuntu-latest` with Q35 and OVMF UEFI. QEMU attaches a read-only VirtIO driver ISO, a VirtIO network adapter, and a sparse writable QCOW2 overlay backed by the immutable `base.qcow2`. The base object is downloaded for each ephemeral runner but is never opened as the writable guest disk.
 
-QEMU user networking forwards TCP 3389 for RDP. The QEMU VNC server listens on TCP 5900 as an independent emergency console. Both listeners bind specifically to the runner's ephemeral Tailscale IPv4 address under `tag:ci`; they do not bind to every host interface.
+QEMU user networking forwards TCP 3389 for RDP. The QEMU VNC server listens on TCP 5900 as an independent emergency console. With Tailscale, both listeners bind specifically to the runner's ephemeral tailnet IPv4 address under `tag:ci`. With Cloudflare or SSH relay, they bind only to loopback and are reached through outbound tunnel processes. No provider binds QEMU to every host interface.
 
 Checkpoint manifest version 3 records both the compressed overlay SHA256 and the immutable base SHA256. Restore rejects archive, manifest, virtual-size, and base-identity mismatches before boot. A legacy version 2 manifest is accepted for migration and upgraded by the next verified checkpoint.
 

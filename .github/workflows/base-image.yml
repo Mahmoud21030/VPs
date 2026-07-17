@@ -11,6 +11,50 @@ on:
         options:
           - backblaze
           - oracle
+      network_provider:
+        description: Private connectivity or authenticated relay provider
+        required: true
+        default: tailscale
+        type: choice
+        options:
+          - tailscale
+          - cloudflare
+          - ssh-relay
+      cloudflare_rdp_hostname:
+        description: Cloudflare Access TCP hostname routed to tcp://127.0.0.1:3389
+        required: false
+        default: ""
+        type: string
+      cloudflare_vnc_hostname:
+        description: Cloudflare Access TCP hostname routed to tcp://127.0.0.1:5900
+        required: false
+        default: ""
+        type: string
+      ssh_relay_host:
+        description: SSH VPS or bastion hostname for reverse forwarding
+        required: false
+        default: ""
+        type: string
+      ssh_relay_user:
+        description: SSH relay login user
+        required: false
+        default: ""
+        type: string
+      ssh_relay_port:
+        description: SSH relay server port
+        required: false
+        default: "22"
+        type: string
+      ssh_relay_rdp_port:
+        description: Loopback-only RDP port created on the SSH relay
+        required: false
+        default: "13389"
+        type: string
+      ssh_relay_vnc_port:
+        description: Loopback-only VNC port created on the SSH relay
+        required: false
+        default: "15900"
+        type: string
       windows_iso_url:
         description: Direct HTTPS URL to Windows ISO
         required: true
@@ -72,6 +116,7 @@ jobs:
 
     env:
       STORAGE_PROVIDER: ${{ inputs.storage_provider || vars.STORAGE_PROVIDER || 'backblaze' }}
+      NETWORK_PROVIDER: ${{ inputs.network_provider || 'tailscale' }}
       B2_BUCKET: ${{ secrets.B2_BUCKET }}
       B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
       B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
@@ -83,6 +128,9 @@ jobs:
       ORACLE_ENDPOINT: ${{ secrets.ORACLE_ENDPOINT }}
       ORACLE_ACCESS_KEY_ID: ${{ secrets.ORACLE_ACCESS_KEY_ID }}
       ORACLE_SECRET_ACCESS_KEY: ${{ secrets.ORACLE_SECRET_ACCESS_KEY }}
+      CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+      SSH_RELAY_PRIVATE_KEY: ${{ secrets.SSH_RELAY_PRIVATE_KEY }}
+      SSH_RELAY_KNOWN_HOSTS: ${{ secrets.SSH_RELAY_KNOWN_HOSTS }}
 
       # AWS CLI v2 compatibility for OCI/S3-compatible multipart uploads.
       AWS_REQUEST_CHECKSUM_CALCULATION: when_required
@@ -190,28 +238,42 @@ jobs:
         run: scripts/storage/login
 
       - name: Connect runner to Tailscale
+        if: inputs.network_provider == 'tailscale'
         uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
 
-      - name: Get Tailscale VNC address
-        id: vnc
+      - name: Start selected private network or relay
+        id: network
         shell: bash
+        env:
+          CLOUDFLARE_RDP_HOSTNAME: ${{ inputs.cloudflare_rdp_hostname }}
+          CLOUDFLARE_VNC_HOSTNAME: ${{ inputs.cloudflare_vnc_hostname }}
+          SSH_RELAY_HOST: ${{ inputs.ssh_relay_host }}
+          SSH_RELAY_USER: ${{ inputs.ssh_relay_user }}
+          SSH_RELAY_PORT: ${{ inputs.ssh_relay_port }}
+          SSH_RELAY_RDP_PORT: ${{ inputs.ssh_relay_rdp_port }}
+          SSH_RELAY_VNC_PORT: ${{ inputs.ssh_relay_vnc_port }}
+        run: scripts/network/setup
+
+      - name: Show VNC connection instructions
+        shell: bash
+        env:
+          CLOUDFLARE_VNC_HOSTNAME: ${{ inputs.cloudflare_vnc_hostname }}
+          SSH_RELAY_HOST: ${{ inputs.ssh_relay_host }}
+          SSH_RELAY_USER: ${{ inputs.ssh_relay_user }}
+          SSH_RELAY_PORT: ${{ inputs.ssh_relay_port }}
+          SSH_RELAY_VNC_PORT: ${{ inputs.ssh_relay_vnc_port }}
         run: |
           set -Eeuo pipefail
-
-          TS_IP="$(tailscale ip -4 | head -n 1)"
-          if [[ -z "$TS_IP" ]]; then
-            echo "::error::Could not determine Tailscale IPv4 address"
-            exit 1
-          fi
-
-          echo "tailscale_ip=$TS_IP" >> "$GITHUB_OUTPUT"
-          echo "VM_BIND_ADDRESS=$TS_IP" >> "$GITHUB_ENV"
-          echo "VNC address will be: ${TS_IP}:5900"
-          tailscale status
+          case "$NETWORK_PROVIDER" in
+            tailscale) echo "VNC: ${{ steps.network.outputs.address }}:5900" ;;
+            cloudflare) echo "Run: cloudflared access tcp --hostname ${CLOUDFLARE_VNC_HOSTNAME} --url localhost:15900" ;;
+            ssh-relay) echo "Run: ssh -p ${SSH_RELAY_PORT} -N -L 15900:127.0.0.1:${SSH_RELAY_VNC_PORT} ${SSH_RELAY_USER}@${SSH_RELAY_HOST}" ;;
+            *) exit 2 ;;
+          esac
 
       - name: Build Windows base image with interactive VNC console
         shell: bash
@@ -224,7 +286,7 @@ jobs:
           MEMORY_MB: ${{ inputs.memory_mb }}
           CPU_CORES: ${{ inputs.cpu_cores }}
           INSTALL_TIMEOUT_MINUTES: ${{ inputs.install_timeout_minutes }}
-          VM_BIND_ADDRESS: ${{ steps.vnc.outputs.tailscale_ip }}
+          VM_BIND_ADDRESS: ${{ steps.network.outputs.address }}
         run: |
           set -Eeuo pipefail
 
@@ -243,7 +305,7 @@ jobs:
 
           echo "Storage provider: $STORAGE_PROVIDER"
           echo "Starting QEMU base-image builder"
-          echo "VNC address: ${{ steps.vnc.outputs.tailscale_ip }}:5900"
+          echo "VNC connectivity provider: $NETWORK_PROVIDER"
           echo "Install Windows manually, then shut Windows down normally."
 
           scripts/qemu/build-base \
@@ -263,7 +325,7 @@ jobs:
             if ss -ltn | grep -q ':5900 '; then
               echo "============================================================"
               echo "VNC SERVER READY"
-              echo "Address: ${{ steps.vnc.outputs.tailscale_ip }}:5900"
+              echo "Provider: $NETWORK_PROVIDER"
               echo "============================================================"
               ss -ltnp | grep ':5900' || true
               break
@@ -288,6 +350,10 @@ jobs:
 
       - name: Upload base image to selected object storage
         run: scripts/storage/upload-base
+
+      - name: Stop selected network or relay
+        if: always()
+        run: scripts/network/cleanup
 
       - name: Upload build logs
         if: always()
