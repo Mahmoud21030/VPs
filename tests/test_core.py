@@ -447,6 +447,15 @@ class CoreTests(unittest.TestCase):
         self.assertNotIn('hostfwd=tcp:0.0.0.0',source)
         self.assertNotIn("'-vnc',f\"0.0.0.0",source)
 
+    def test_pinggy_setup_does_not_expand_local_name_during_declaration(self):
+        source=(ROOT/'scripts'/'network'/'setup').read_text(encoding='utf-8')
+        for line in source.splitlines():
+            if line.lstrip().startswith('local '):
+                self.assertFalse(
+                    'name=' in line and '${name}' in line,
+                    'set -u expands ${name} before a same-line local assignment',
+                )
+
 
 if __name__ == '__main__':
     unittest.main()

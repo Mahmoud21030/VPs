@@ -148,8 +148,10 @@ case "$provider" in
     install -d -m 0700 "$pinggy_dir"
 
     start_pinggy_tunnel() {
-      local name="$1" local_port="$2" log_file="$LOG_DIR/pinggy-${name}.log"
-      local pid_file="$WORK_DIR/pinggy-${name}.pid" pid endpoint=""
+      local name="$1" local_port="$2"
+      local log_file pid_file pid endpoint=""
+      log_file="$LOG_DIR/pinggy-${name}.log"
+      pid_file="$WORK_DIR/pinggy-${name}.pid"
       ssh -p 443 -T \
         -o BatchMode=yes \
         -o ConnectTimeout=30 \
