@@ -9,8 +9,9 @@ on:
         default: backblaze
         type: choice
         options:
-          - backblaze
           - oracle
+          - backblaze
+
       network_provider:
         description: Connectivity provider (Pinggy creates public TCP endpoints)
         required: true
