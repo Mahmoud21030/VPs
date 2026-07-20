@@ -1,5 +1,5 @@
 {
-  "default_provider": "backblaze",
+  "default_provider": "oracle",
   "remote_prefix": "windows-vm",
   "base_object": "base.qcow2",
   "latest_object": "latest/overlay.qcow2.zst",
