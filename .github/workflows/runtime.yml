@@ -6,7 +6,7 @@ on:
       storage_provider:
         description: Object storage provider
         required: true
-        default: backblaze
+        default: oracle
         type: choice
         options:
           - oracle
