@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+##############################################################################
+# Copy Oracle VM to Backblaze
+#
+# This script copies the Windows VM base image and latest overlay from
+# Oracle Object Storage to Backblaze B2.
+#
+# Required environment variables:
+#   Oracle:
+#     - ORACLE_BUCKET
+#     - ORACLE_NAMESPACE
+#     - ORACLE_REGION
+#     - ORACLE_ACCESS_KEY_ID
+#     - ORACLE_SECRET_ACCESS_KEY
+#     - ORACLE_ENDPOINT (optional)
+#
+#   Backblaze:
+#     - B2_BUCKET
+#     - B2_ENDPOINT
+#     - B2_KEY_ID
+#     - B2_APPLICATION_KEY
+#     - B2_REGION (optional)
+#
+# Optional inputs:
+#   OBJECT_PREFIX      - Prefix for VM objects (default: windows-vm)
+#   VERIFY_CHECKSUMS   - Verify SHA256 after copy (default: true)
+#   DRY_RUN            - Show what would be copied without doing it (default: false)
+##############################################################################
+
+set -Eeuo pipefail
+
+# Defaults
+OBJECT_PREFIX="${OBJECT_PREFIX:-windows-vm}"
+VERIFY_CHECKSUMS="${VERIFY_CHECKSUMS:-true}"
+DRY_RUN="${DRY_RUN:-false}"
+
+# Utility functions
+log() {
+    printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
+}
+
+error() {
+    printf '[%s] ERROR: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2
+    exit 1
+}
+
+require_env() {
+    local var="$1"
+    if [[ -z "${!var:-}" ]]; then
+        error "Missing required environment variable: $var"
+    fi
+}
+
+# Validate inputs
+validate_inputs() {
+    log "Validating inputs..."
+
+    # Check required Oracle vars
+    require_env "ORACLE_BUCKET"
+    require_env "ORACLE_NAMESPACE"
+    require_env "ORACLE_REGION"
+    require_env "ORACLE_ACCESS_KEY_ID"
+    require_env "ORACLE_SECRET_ACCESS_KEY"
+
+    # Check required Backblaze vars
+    require_env "B2_BUCKET"
+    require_env "B2_ENDPOINT"
+    require_env "B2_KEY_ID"
+    require_env "B2_APPLICATION_KEY"
+
+    # Validate object prefix
+    if [[ ! "$OBJECT_PREFIX" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] ||
+       [[ "$OBJECT_PREFIX" == /* ]] || [[ "$OBJECT_PREFIX" == *".."* ]] ||
+       [[ "$OBJECT_PREFIX" == *"//"* ]] || [[ "$OBJECT_PREFIX" == */ ]]; then
+        error "OBJECT_PREFIX must be a normalized safe relative object prefix"
+    fi
+
+    # Resolve B2 region
+    if [[ -z "${B2_REGION:-}" ]]; then
+        b2_host="${B2_ENDPOINT#*://}"
+        b2_host="${b2_host%%/*}"
+        B2_REGION="${b2_host#s3.}"
+        B2_REGION="${B2_REGION%%.backblazeb2.com}"
+        if [[ "$B2_REGION" == "$b2_host" ]]; then
+            B2_REGION="us-east-1"
+        fi
+    fi
+
+    # Resolve Oracle endpoint
+    if [[ -z "${ORACLE_ENDPOINT:-}" ]]; then
+        ORACLE_ENDPOINT="https://${ORACLE_NAMESPACE}.compat.objectstorage.${ORACLE_REGION}.oci.customer-oci.com"
+    fi
+
+    # Validate endpoints
+    case "$B2_ENDPOINT" in
+        https://*) ;;
+        *) error "B2_ENDPOINT must be an absolute HTTPS URL" ;;
+    esac
+
+    case "$ORACLE_ENDPOINT" in
+        https://*) ;;
+        *) error "ORACLE_ENDPOINT must be an absolute HTTPS URL" ;;
+    esac
+
+    if [[ "$B2_ENDPOINT" == *"@"* ]] || [[ "$B2_ENDPOINT" == *"?"* ]] || [[ "$B2_ENDPOINT" == *"#"* ]]; then
+        error "B2_ENDPOINT must not contain credentials, a query, or a fragment"
+    fi
+
+    if [[ "$ORACLE_ENDPOINT" == *"@"* ]] || [[ "$ORACLE_ENDPOINT" == *"?"* ]] || [[ "$ORACLE_ENDPOINT" == *"#"* ]]; then
+        error "ORACLE_ENDPOINT must not contain credentials, a query, or a fragment"
+    fi
+
+    log "Input validation passed"
+}
+
+# Configure AWS CLI
+setup_aws_cli() {
+    log "Configuring AWS CLI..."
+    mkdir -p "$HOME/.aws"
+
+    cat > "$HOME/.aws/config" <<'EOF'
+[default]
+request_checksum_calculation = when_required
+response_checksum_validation = when_required
+
+s3 =
+  addressing_style = path
+  signature_version = s3v4
+EOF
+
+    export AWS_REQUEST_CHECKSUM_CALCULATION=when_required
+    export AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
+    export AWS_EC2_METADATA_DISABLED=true
+
+    log "AWS CLI configured"
+}
+
+# Wrapper for Oracle AWS CLI calls
+oracle_aws() {
+    env \
+        AWS_ACCESS_KEY_ID="$ORACLE_ACCESS_KEY_ID" \
+        AWS_SECRET_ACCESS_KEY="$ORACLE_SECRET_ACCESS_KEY" \
+        AWS_DEFAULT_REGION="$ORACLE_REGION" \
+        AWS_REQUEST_CHECKSUM_CALCULATION=when_required \
+        AWS_RESPONSE_CHECKSUM_VALIDATION=when_required \
+        AWS_EC2_METADATA_DISABLED=true \
+        aws --endpoint-url "$ORACLE_ENDPOINT" "$@"
+}
+
+# Wrapper for Backblaze AWS CLI calls
+b2_aws() {
+    env \
+        AWS_ACCESS_KEY_ID="$B2_KEY_ID" \
+        AWS_SECRET_ACCESS_KEY="$B2_APPLICATION_KEY" \
+        AWS_DEFAULT_REGION="$B2_REGION" \
+        AWS_REQUEST_CHECKSUM_CALCULATION=when_required \
+        AWS_RESPONSE_CHECKSUM_VALIDATION=when_required \
+        AWS_EC2_METADATA_DISABLED=true \
+        aws --endpoint-url "$B2_ENDPOINT" "$@"
+}
+
+# Test Oracle connectivity
+test_oracle_connection() {
+    log "Testing Oracle connectivity..."
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "[DRY RUN] Would test Oracle bucket: $ORACLE_BUCKET"
+        return 0
+    fi
+
+    oracle_aws s3api head-bucket --bucket "$ORACLE_BUCKET" >/dev/null || error "Cannot access Oracle bucket"
+    log "Oracle connectivity verified"
+}
+
+# Test Backblaze connectivity
+test_b2_connection() {
+    log "Testing Backblaze connectivity..."
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "[DRY RUN] Would test Backblaze bucket: $B2_BUCKET"
+        return 0
+    fi
+
+    b2_aws s3 ls "s3://$B2_BUCKET" >/dev/null || error "Cannot access Backblaze bucket"
+    log "Backblaze connectivity verified"
+}
+
+# Check if objects exist in Oracle
+check_oracle_objects() {
+    log "Checking Oracle for VM objects..."
+
+    local objects=(
+        "${OBJECT_PREFIX}/base.qcow2"
+        "${OBJECT_PREFIX}/latest/overlay.qcow2.zst"
+        "${OBJECT_PREFIX}/latest/overlay.sha256"
+        "${OBJECT_PREFIX}/latest/manifest.json"
+    )
+
+    for obj in "${objects[@]}"; do
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log "[DRY RUN] Would check: s3://$ORACLE_BUCKET/$obj"
+        else
+            if oracle_aws s3api head-object --bucket "$ORACLE_BUCKET" --key "$obj" >/dev/null 2>&1; then
+                log "Found: $obj"
+            else
+                error "Missing object in Oracle: $obj"
+            fi
+        fi
+    done
+
+    log "All required objects found in Oracle"
+}
+
+# Download from Oracle
+download_from_oracle() {
+    log "Downloading from Oracle..."
+
+    mkdir -p vm
+
+    local files=(
+        "base.qcow2"
+        "latest/overlay.qcow2.zst"
+        "latest/overlay.sha256"
+        "latest/manifest.json"
+    )
+
+    for file in "${files[@]}"; do
+        local source="s3://$ORACLE_BUCKET/$OBJECT_PREFIX/$file"
+        local dest="vm/$file"
+
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log "[DRY RUN] Would download: $source -> $dest"
+        else
+            log "Downloading: $file"
+            mkdir -p "$(dirname "$dest")"
+            oracle_aws s3 cp "$source" "$dest" --no-progress || error "Failed to download $file"
+        fi
+    done
+
+    log "Download complete"
+}
+
+# Verify downloaded overlay
+verify_overlay() {
+    if [[ "$VERIFY_CHECKSUMS" != "true" ]]; then
+        log "Skipping overlay verification (VERIFY_CHECKSUMS=false)"
+        return 0
+    fi
+
+    log "Verifying downloaded overlay..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "[DRY RUN] Would verify: vm/overlay.sha256"
+        return 0
+    fi
+
+    cd vm
+    sha256sum -c overlay.sha256 || error "Overlay verification failed"
+    cd -
+    log "Overlay verification passed"
+}
+
+# Upload to Backblaze
+upload_to_backblaze() {
+    log "Uploading to Backblaze..."
+
+    local files=(
+        "base.qcow2"
+        "latest/overlay.qcow2.zst"
+        "latest/overlay.sha256"
+        "latest/manifest.json"
+    )
+
+    for file in "${files[@]}"; do
+        local source="vm/$file"
+        local dest="s3://$B2_BUCKET/$OBJECT_PREFIX/$file"
+
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log "[DRY RUN] Would upload: $source -> $dest"
+        else
+            log "Uploading: $file"
+            b2_aws s3 cp "$source" "$dest" --no-progress || error "Failed to upload $file"
+        fi
+    done
+
+    log "Upload complete"
+}
+
+# Verify upload
+verify_upload() {
+    if [[ "$VERIFY_CHECKSUMS" != "true" ]]; then
+        log "Skipping upload verification (VERIFY_CHECKSUMS=false)"
+        return 0
+    fi
+
+    log "Verifying uploaded overlay..."
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "[DRY RUN] Would verify upload"
+        return 0
+    fi
+
+    mkdir -p verify
+
+    b2_aws s3 cp \
+        "s3://$B2_BUCKET/$OBJECT_PREFIX/latest/overlay.qcow2.zst" \
+        verify/overlay.qcow2.zst \
+        --no-progress || error "Failed to download overlay for verification"
+
+    cp vm/overlay.sha256 verify/
+
+    cd verify
+    sha256sum -c overlay.sha256 || error "Upload verification failed"
+    cd -
+
+    log "Upload verification passed"
+}
+
+# Cleanup
+cleanup() {
+    log "Cleaning up temporary files..."
+    rm -rf vm verify
+    log "Cleanup complete"
+}
+
+# Main execution
+main() {
+    log "Starting Oracle to Backblaze copy operation"
+    log "Object prefix: $OBJECT_PREFIX"
+    log "Verify checksums: $VERIFY_CHECKSUMS"
+    log "Dry run: $DRY_RUN"
+    echo
+
+    validate_inputs
+    setup_aws_cli
+    test_oracle_connection
+    test_b2_connection
+    check_oracle_objects
+    download_from_oracle
+    verify_overlay
+    upload_to_backblaze
+    verify_upload
+    cleanup
+
+    echo
+    log "=========================================="
+    log "Copy operation completed successfully!"
+    log "=========================================="
+}
+
+# Run main
+main "$@"
