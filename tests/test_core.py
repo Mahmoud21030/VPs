@@ -450,6 +450,18 @@ class CoreTests(unittest.TestCase):
         )
         self.assertEqual(dependabot.get('version'),'2')
 
+    def test_oracle_to_b2_copy_verifies_latest_overlay_paths(self):
+        script=(ROOT/'scripts'/'copy-oracle-to-backblaze').read_text(
+            encoding='utf-8'
+        )
+        self.assertIn('cd vm/latest',script)
+        self.assertIn('cp vm/latest/overlay.sha256 verify/latest/',script)
+        self.assertIn('verify/latest/overlay.qcow2.zst',script)
+        self.assertNotIn('cp vm/overlay.sha256',script)
+
+        workflow=ROOT/'.github'/'workflows'/'copy-oracle-to-backblaze.yml'
+        self.assertTrue(workflow.exists())
+
     def test_vm_workflows_offer_network_providers(self):
         for name in ('runtime.yml','base-image.yml'):
             workflow=yaml.load(

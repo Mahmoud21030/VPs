@@ -1,0 +1,84 @@
+name: Copy Oracle VM to Backblaze B2
+
+on:
+  workflow_dispatch:
+    inputs:
+      object_prefix:
+        description: Object prefix containing base.qcow2 and latest overlay objects
+        required: false
+        default: windows-vm
+        type: string
+      verify_checksums:
+        description: Download uploaded overlay and verify SHA256
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      dry_run:
+        description: Validate configuration and print planned operations only
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-vm-storage
+  cancel-in-progress: false
+
+jobs:
+  copy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      ORACLE_BUCKET: ${{ secrets.ORACLE_BUCKET }}
+      ORACLE_NAMESPACE: ${{ secrets.ORACLE_NAMESPACE }}
+      ORACLE_REGION: ${{ secrets.ORACLE_REGION }}
+      ORACLE_ACCESS_KEY_ID: ${{ secrets.ORACLE_ACCESS_KEY_ID }}
+      ORACLE_SECRET_ACCESS_KEY: ${{ secrets.ORACLE_SECRET_ACCESS_KEY }}
+      ORACLE_ENDPOINT: ${{ secrets.ORACLE_ENDPOINT }}
+      B2_BUCKET: ${{ secrets.B2_BUCKET }}
+      B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
+      B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+      B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+      B2_REGION: ${{ secrets.B2_REGION }}
+      OBJECT_PREFIX: ${{ inputs.object_prefix }}
+      VERIFY_CHECKSUMS: ${{ inputs.verify_checksums }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      AWS_EC2_METADATA_DISABLED: "true"
+
+    steps:
+      - name: Show runner operating system CPU RAM swap and storage
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          uname -a
+          cat /etc/os-release
+          lscpu
+          echo "Logical CPU count: $(nproc)"
+          free -h
+          grep -E 'MemTotal|MemAvailable|SwapTotal|SwapFree' /proc/meminfo
+          lsblk -o NAME,TYPE,SIZE,FSTYPE,FSAVAIL,MOUNTPOINTS
+          df -hT
+          df -B1 -P
+
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Use largest writable filesystem for transfer staging
+        run: scripts/bootstrap/prepare-work-drive.sh
+
+      - name: Install host dependencies
+        run: scripts/bootstrap/install.sh
+
+      - name: Copy Oracle base and latest overlay to Backblaze B2
+        shell: bash
+        run: scripts/copy-oracle-to-backblaze

@@ -248,13 +248,14 @@ verify_overlay() {
     log "Verifying downloaded overlay..."
 
     if [[ "$DRY_RUN" == "true" ]]; then
-        log "[DRY RUN] Would verify: vm/overlay.sha256"
+        log "[DRY RUN] Would verify: vm/latest/overlay.sha256"
         return 0
     fi
 
-    cd vm
-    sha256sum -c overlay.sha256 || error "Overlay verification failed"
-    cd -
+    (
+        cd vm/latest
+        sha256sum -c overlay.sha256
+    ) || error "Overlay verification failed"
     log "Overlay verification passed"
 }
 
@@ -294,22 +295,23 @@ verify_upload() {
     log "Verifying uploaded overlay..."
 
     if [[ "$DRY_RUN" == "true" ]]; then
-        log "[DRY RUN] Would verify upload"
+        log "[DRY RUN] Would verify upload with verify/latest/overlay.sha256"
         return 0
     fi
 
-    mkdir -p verify
+    mkdir -p verify/latest
 
     b2_aws s3 cp \
         "s3://$B2_BUCKET/$OBJECT_PREFIX/latest/overlay.qcow2.zst" \
-        verify/overlay.qcow2.zst \
+        verify/latest/overlay.qcow2.zst \
         --no-progress || error "Failed to download overlay for verification"
 
-    cp vm/overlay.sha256 verify/
+    cp vm/latest/overlay.sha256 verify/latest/
 
-    cd verify
-    sha256sum -c overlay.sha256 || error "Upload verification failed"
-    cd -
+    (
+        cd verify/latest
+        sha256sum -c overlay.sha256
+    ) || error "Upload verification failed"
 
     log "Upload verification passed"
 }
